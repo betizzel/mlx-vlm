@@ -1,3 +1,14 @@
+> **This fork (branch `m5pro-qwen27`)** is mlx-vlm 0.7.11 plus three fixes, used to serve Qwen3.8-27B (6-bit, 128K
+> context, native MTP) on a 48 GB Apple Silicon Mac:
+> 1. Prompt admission no longer keeps the previous KV and recurrent buffers alive through the step's unused lazy
+>    output and logits graphs.
+> 2. `cache_nbytes` no longer under-counts when a freed temporary view's object id is reused; `BatchQuantizedKVCache`
+>    reports its bytes.
+> 3. Native MTP speculation honors thinking budgets.
+>
+> Each fix comes with regression tests. Upstream: [Neywa-Labs/mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) (MIT).
+> Fixes 1 and 2 still apply to upstream 0.8.0; upstream 0.8.0 added its own MTP thinking-budget support.
+
 [![Upload Python Package](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml)
 # MLX-VLM
 
