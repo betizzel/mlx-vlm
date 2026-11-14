@@ -95,6 +95,30 @@ ordinary prefill calls retain their bulk execution path. Verification must:
 Fused argmax and custom Metal kernels are optimizations, not correctness
 shortcuts. Keep the full-logit fallback until parity is proven.
 
+### Thinking budgets
+
+MTP supports the existing `ThinkingBudgetCriteria` contract, including a prompt
+that already opened thinking. The first target token and each subsequently
+selected token advance the criteria exactly once. As in ordinary decoding,
+exceeding the budget schedules the closing sequence for following positions;
+the forced newline/end marker still count toward `max_tokens`, and answer
+generation continues afterward. A short output limit can truncate that sequence.
+
+The MTP acceptance walk applies pending forced tokens before comparing with the
+draft. A mismatch ends the accepted prefix: the existing target transaction and
+drafter acceptance hooks rewind the suffix, and the forced bonus is fed to the
+target on the next round. Rejected proposals never advance the thinking count.
+If a proposal matches a forced token, verification can continue on that valid
+prefix. Lockstep caches stop all rows at the first rejection. Stochastic target
+sampling still draws once per selected position before the ordinary override;
+position-keyed sampling retains each request's generated-token position.
+
+The server carries independent criteria and output limits for batched requests.
+The direct `generate_step`/`stream_generate` budget interface remains single-row;
+batched budgets use the server's per-request interface. DFlash/EAGLE-3 thinking
+budgets and structured-output speculation remain unsupported.
+
+
 ## Temporal caches for linear attention
 
 `ArraysCache` owns a bounded history for the active verification window. Normal

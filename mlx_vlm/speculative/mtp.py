@@ -32,6 +32,7 @@ class _MTPVerifyResult:
     shared_kv_states: dict
     target_tokens: Optional[mx.array] = None
     rollback_state: Any = None
+    target_logits: Optional[mx.array] = None
 
     def abort(self):
         abort_speculative_round(self.rollback_state)
@@ -157,6 +158,7 @@ def _mtp_verify_target(
     sampler: Callable[[mx.array], mx.array],
     *,
     sample_target_tokens: bool = True,
+    defer_target_sampling: bool = False,
 ) -> _MTPVerifyResult:
     result = None
     try:
@@ -204,7 +206,10 @@ def _mtp_verify_target(
         result.hidden = verify_out.hidden_states[-1]
         result.shared_kv_states = verify_out.shared_kv_states or {}
         if verify_out.logits is not None:
-            result.target_tokens = sampler(verify_out.logits)
+            if defer_target_sampling:
+                result.target_logits = verify_out.logits
+            else:
+                result.target_tokens = sampler(verify_out.logits)
         elif sample_target_tokens:
             # Fused greedy readout is safe for already-normalized hidden states.
             head = getattr(lm, "lm_head", None)
@@ -491,6 +496,84 @@ def _mtp_acceptance_walk(
     )
 
 
+def _mtp_budget_acceptance_walk(
+    lm,
+    verify,
+    draft_tokens,
+    sampler,
+    budgets,
+    criteria,
+    *,
+    row_ids,
+    base_positions,
+    uniform=False,
+    stop_check=None,
+):
+    """Apply the ordinary next-token budget override before accepting drafts.
+
+    Only emitted tokens advance the criteria. A forced mismatch is the bonus
+    token, so the usual accepted+1 cache transaction discards its draft suffix.
+    The bonus itself is processed by the target at the start of the next round.
+    """
+    drafts = draft_tokens.tolist()
+    batch, n_draft = draft_tokens.shape
+    targets = (
+        verify.target_tokens.tolist() if verify.target_tokens is not None else None
+    )
+    accepted = [0] * batch
+    new_tokens = [[] for _ in range(batch)]
+    done = [budget <= 0 for budget in budgets]
+    for pos in range(n_draft + 1):
+        if all(done):
+            break
+        if targets is None:
+            with mx.stream(generation_stream):
+                logits = (
+                    verify.target_logits[:, pos, :]
+                    if verify.target_logits is not None
+                    else _mtp_logits_from_hidden(lm, verify.hidden[:, pos : pos + 1])
+                )
+                if logits.ndim == 3:
+                    logits = logits[:, 0, :]
+                logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+                sampled = _sample_mtp_target(
+                    sampler, logprobs, row_ids, base_positions, pos
+                )
+            mx.eval(sampled)
+            tokens = sampled.reshape(-1).tolist()
+        else:
+            tokens = [row[pos] for row in targets]
+
+        matches = [False] * batch
+        for row, token in enumerate(tokens):
+            if done[row]:
+                continue
+            criterion = criteria[row]
+            if criterion is not None:
+                # Still sample this position, as AR does before overriding it.
+                forced = criterion.pop_forced_token_id()
+                if forced is not None:
+                    token = forced
+                criterion(token)
+            new_tokens[row].append(int(token))
+            terminal = len(new_tokens[row]) >= budgets[row] or (
+                stop_check is not None and stop_check(row, int(token))
+            )
+            matches[row] = (
+                not terminal and pos < n_draft and token == drafts[row][pos]
+            )
+            done[row] = not matches[row]
+
+        # Lockstep caches and unpositioned stochastic samplers must stop all
+        # rows together, before advancing any criterion into a discarded suffix.
+        if uniform and not all(matches):
+            break
+        for row, match in enumerate(matches):
+            if match:
+                accepted[row] += 1
+    return accepted, new_tokens
+
+
 def _slice_shared_kv_after_reject(shared_kv_states: dict, rejected: int) -> dict:
     if rejected <= 0:
         return shared_kv_states
@@ -598,6 +681,8 @@ def _mtp_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
+    thinking_budget_criteria: Optional[Any] = None,
+    eos_token_ids: Optional[set] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     """Verify autoregressive MTP drafts and commit accepted state before emission."""
     lm = model.language_model if hasattr(model, "language_model") else model
@@ -679,16 +764,37 @@ def _mtp_rounds(
                     prompt_cache,
                     sampler,
                     sample_target_tokens=greedy_sampling,
+                    defer_target_sampling=(
+                        thinking_budget_criteria is not None and not greedy_sampling
+                    ),
                 )
-            accepted, new_tokens = _mtp_acceptance_walk(
-                lm,
-                verify,
-                draft_tokens,
-                sampler,
-                max_tokens - emitted,
-                row_id=0,
-                base_position=emitted,
-            )
+            if thinking_budget_criteria is not None:
+                accepted_rows, token_rows = _mtp_budget_acceptance_walk(
+                    lm,
+                    verify,
+                    draft_tokens,
+                    sampler,
+                    [max_tokens - emitted],
+                    [thinking_budget_criteria],
+                    row_ids=[0],
+                    base_positions=[emitted],
+                    stop_check=(
+                        (lambda row, token: token in eos_token_ids)
+                        if eos_token_ids is not None
+                        else None
+                    ),
+                )
+                accepted, new_tokens = accepted_rows[0], token_rows[0]
+            else:
+                accepted, new_tokens = _mtp_acceptance_walk(
+                    lm,
+                    verify,
+                    draft_tokens,
+                    sampler,
+                    max_tokens - emitted,
+                    row_id=0,
+                    base_position=emitted,
+                )
             sampler_rng.target_sampled(
                 sync_draft=not _sampler_supports_positioned_target(sampler)
             )
@@ -719,7 +825,11 @@ def _mtp_rounds(
         for tok in new_tokens:
             yield tok, None
             emitted += 1
-            if emitted >= max_tokens:
+            if emitted >= max_tokens or (
+                thinking_budget_criteria is not None
+                and eos_token_ids is not None
+                and tok in eos_token_ids
+            ):
                 return
 
         # Hidden for next round: pick the slot of the newly accepted bonus.
@@ -885,6 +995,8 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
+    thinking_budget_criteria: Optional[List[Any]] = None,
+    max_tokens_per_row: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -899,6 +1011,9 @@ def _mtp_rounds_batch(
 
     B = first_bonus.shape[0]
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
+    criteria = thinking_budget_criteria or [None] * B
+    limits = max_tokens_per_row or [max_tokens] * B
+    has_thinking_budget = any(criterion is not None for criterion in criteria)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     if (
         B > 1
@@ -962,13 +1077,46 @@ def _mtp_rounds_batch(
 
     b = first_bonus.tolist()
     emitted = [1] * B
-    finished = [False] * B
+    finished = [
+        limits[row] <= 1
+        or (eos_token_ids is not None and token in eos_token_ids)
+        or (stop_check is not None and stop_check(row, token))
+        for row, token in enumerate(b)
+    ]
     active_idx = list(range(B))
+    # First-token EOS/length completion happens before this generator starts.
+    # Remove those rows before drafting or drawing another target sample.
+    if any(finished) and all(hasattr(c, "filter") for c in prompt_cache):
+        active_idx = [row for row in active_idx if not finished[row]]
+        if not active_idx:
+            return
+        keep = mx.array(active_idx, dtype=mx.int32)
+        for entry in prompt_cache:
+            entry.filter(keep)
+        filter_drafter = getattr(draft_model, "filter_batch", None)
+        if callable(filter_drafter):
+            filter_drafter(keep)
+        hidden = hidden[keep]
+        shared_kv_states = {
+            key: (keys[keep], values[keep])
+            for key, (keys, values) in shared_kv_states.items()
+        }
+        valid_positions = [positions[row] for row in active_idx]
+        draft_model.set_shared_kv(
+            shared_kv_states,
+            kv_offset=max(valid_positions),
+            position=_mtp_draft_position(mx.array(valid_positions)),
+            kv_valid_len=mx.array(valid_positions),
+            left_padding=_batch_cache_left_padding(prompt_cache),
+        )
 
     while len(active_idx) > 0:
+        if all(finished[row] for row in active_idx):
+            break
         remaining = [
-            max(1, max_tokens - emitted[active_idx[j]] + 1)
+            max(1, limits[active_idx[j]] - emitted[active_idx[j]] + 1)
             for j in range(len(active_idx))
+            if not finished[active_idx[j]]
         ]
         bs = _mtp_next_block_size(
             draft_model,
@@ -1009,12 +1157,43 @@ def _mtp_rounds_batch(
                     prompt_cache,
                     sampler,
                     sample_target_tokens=greedy_sampling,
+                    defer_target_sampling=has_thinking_budget and not greedy_sampling,
                 )
                 hidden_full = verify.hidden  # [B_active, bs, H]
 
             # Walk per-row
-            budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-            if verify.target_tokens is not None:
+            budgets = [
+                0 if finished[orig] else limits[orig] - emitted[orig]
+                for orig in active_idx
+            ]
+            if has_thinking_budget:
+                def walk_stop(row, token):
+                    return (
+                        eos_token_ids is not None and token in eos_token_ids
+                    ) or (stop_check is not None and stop_check(active_idx[row], token))
+
+                accepted_list, new_tokens_list = _mtp_budget_acceptance_walk(
+                    lm,
+                    verify,
+                    draft_tokens,
+                    sampler,
+                    budgets,
+                    [criteria[orig] for orig in active_idx],
+                    row_ids=[row_ids[orig] for orig in active_idx],
+                    base_positions=[emitted[orig] for orig in active_idx],
+                    uniform=_mtp_use_uniform_deferred_walk(
+                        draft_model,
+                        n_active=n_active,
+                        greedy_sampling=greedy_sampling,
+                        sampler=sampler,
+                        target_model=lm,
+                    ),
+                    stop_check=walk_stop,
+                )
+                sampler_rng.target_sampled(
+                    sync_draft=not _sampler_supports_positioned_target(sampler)
+                )
+            elif verify.target_tokens is not None:
                 sampler_rng.target_eval(verify.target_tokens, hidden_full)
                 accepted_list, new_tokens_list = _speculative_walk_batch(
                     draft_tokens, verify.target_tokens, budgets
@@ -1113,7 +1292,7 @@ def _mtp_rounds_batch(
                     tok = new_tokens_list[j][pos]
                     tokens_out[orig] = tok
                     emitted[orig] += 1
-                    if emitted[orig] >= max_tokens:
+                    if emitted[orig] >= limits[orig]:
                         finished[orig] = True
                     if eos_token_ids is not None and tok in eos_token_ids:
                         finished[orig] = True

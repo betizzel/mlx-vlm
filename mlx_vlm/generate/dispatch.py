@@ -1099,8 +1099,11 @@ def stream_generate(
 
             generated_tokens.append(token)
 
-            # Check thinking budget and force token if needed
-            if thinking_criteria is not None:
+            # MTP advances the criteria while selecting its accepted prefix;
+            # counting here would charge the same tokens a second time.
+            if thinking_criteria is not None and not (
+                kwargs.get("draft_model") is not None and kwargs.get("draft_kind") == "mtp"
+            ):
                 thinking_criteria(token)
 
             # Stop generation if the token is in the eos_token_ids

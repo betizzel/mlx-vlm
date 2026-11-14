@@ -17,11 +17,20 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.speculative.utils as speculative
-from mlx_vlm.generate.ar import _make_cache, generate_step
+from mlx_vlm.generate.ar import (
+    SpeculativeGenerationBatch,
+    _make_cache,
+    generate_step,
+)
 from mlx_vlm.models import fast_ops
 from mlx_vlm.models import quantized_verifier as quantized
 from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
-from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache
+from mlx_vlm.models.cache import (
+    ArraysCache,
+    BatchKVCache,
+    BatchQuantizedKVCache,
+    KVCache,
+)
 from mlx_vlm.models.linear import native_batch_linear
 from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from mlx_vlm.quantization.nvfp4 import ScaledQuantizedLinear
@@ -42,7 +51,7 @@ from mlx_vlm.tests.test_models import (
     model_case,
     tiny_config,
 )
-from mlx_vlm.utils import get_model_and_args
+from mlx_vlm.utils import ThinkingBudgetCriteria, get_model_and_args
 
 parametrize = pytest.mark.parametrize
 DATA = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
@@ -593,6 +602,273 @@ def test_round_commit_close_and_abort(kind, batch, token, failure):
     offset = caches[1].offset
     equal(mx.array(offset).reshape(-1), mx.array([2 + retained] * batch))
     generator.close()
+
+
+class BudgetTarget(TransactionTarget):
+    """Token-dependent logits plus real temporal/KV rollback, without weights."""
+
+    def __init__(self, natural_end=False):
+        super().__init__(4)
+        self.config = NS(model_type="test", eos_token_id=0)
+        self.natural_end = natural_end
+
+    def __call__(self, inputs, cache, **kwargs):
+        batch, length = inputs.shape
+        self.transaction = start_speculative_cache(cache, length)
+        states = cache[0][0][:, None] + mx.cumsum(inputs, axis=1)[:, :, None]
+        cache[0][0] = states[:, -1]
+        cache[0].record_speculative_states(0, states[:, :-1], states[:, -1])
+        kv = mx.broadcast_to(inputs[:, None, :, None], (batch, 1, length, 64))
+        kv = kv.astype(mx.float32)
+        cache[1].update_and_fetch(kv, kv)
+        next_tokens = mx.where(inputs == 6, 7, mx.where(inputs == 7, 0, 4))
+        if self.natural_end:
+            next_tokens = mx.where(inputs == 4, 6, next_tokens)
+        logits = mx.eye(8)[next_tokens] * 9
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=[logits],
+            shared_kv_states={},
+            gdn_states=self.transaction,
+        )
+
+
+class BudgetDrafter(TransactionDrafter):
+    supports_ragged_batch_acceptance = True
+
+    def __init__(self, proposals=(4, 4, 4)):
+        super().__init__()
+        self.proposals = proposals
+
+    def draft_block(
+        self, bonus, hidden, cache, block_size, sampler, token_dtype, **kwargs
+    ):
+        return mx.broadcast_to(
+            mx.array(self.proposals[: block_size - 1], dtype=token_dtype),
+            (hidden.shape[0], block_size - 1),
+        )
+
+
+def budget_criteria(budget, *, preopened=True, enabled=True):
+    tokenizer = NS(
+        encode=lambda text, **kw: {"<think>": [3], "</think>": [6], "\n": [5]}[text]
+    )
+    return ThinkingBudgetCriteria(
+        tokenizer,
+        budget,
+        thinking_start_token="<think>",
+        enable_thinking=enabled,
+        prompt_preopens_thinking=preopened,
+    )
+
+
+def budget_caches(batch=1, kv_bits=None):
+    kv = (
+        BatchKVCache([0] * batch)
+        if kv_bits is None
+        else BatchQuantizedKVCache([0] * batch, group_size=64, bits=kv_bits)
+    )
+    caches = [ArraysCache(1), kv]
+    caches[0][0] = mx.zeros((batch, 1))
+    initial = mx.zeros((batch, 1, 2, 64))
+    caches[1].update_and_fetch(initial, initial)
+    return caches
+
+
+@parametrize("path", ["direct", "server"])
+@parametrize("sampling", ["greedy", "sequential", "positioned"])
+@parametrize("proposals", [(4, 4, 4), (4, 5, 6), (2, 2, 2)])
+@parametrize("kv_bits", [None, 6])
+def test_mtp_thinking_budget_closes_and_continues(path, sampling, proposals, kv_bits):
+    target, drafter = BudgetTarget(), BudgetDrafter(proposals)
+    caches, criteria = budget_caches(kv_bits=kv_bits), budget_criteria(1)
+    sampled_positions = []
+
+    def sample(logits):
+        # A deterministic target distribution, recording draws even for forced
+        # tokens. Deferred sampling must not visit a rejected draft suffix.
+        assert logits.shape == (1, 8)
+        sampled_positions.append(len(sampled_positions) + 1)
+        return greedy(logits)
+
+    if sampling == "greedy":
+        sampler = greedy
+    elif sampling == "positioned":
+        def positioned(logits, *, row_ids, positions):
+            assert row_ids == [0]
+            sampled_positions.extend(positions)
+            return greedy(logits)
+
+        sampler = NS(sample_target=positioned)
+    else:
+        sampler = sample
+
+    if path == "direct":
+        generator = speculative.run_speculative_rounds(
+            target,
+            drafter,
+            caches,
+            mx.array([[1, 2]]),
+            mx.array([4]),
+            None,
+            NS(hidden_states=[mx.zeros((1, 1, 8))], shared_kv_states={}),
+            draft_kind="mtp",
+            max_tokens=6,
+            sampler=sampler,
+            draft_block_size=4,
+            sampler_is_greedy=sampling == "greedy",
+            thinking_budget_criteria=criteria,
+        )
+        tokens = [token for token, _ in generator]
+    else:
+        batch = SpeculativeGenerationBatch(
+            target,
+            drafter,
+            "mtp",
+            [100],
+            mx.array([4]),
+            caches,
+            sampler,
+            lambda token: token == 0,
+            [6],
+            mx.zeros((1, 1, 8)),
+            {},
+            mx.array([[1, 2]]),
+            draft_block_size=4,
+            greedy_sampling=sampling == "greedy",
+            thinking_budget_criteria=[criteria],
+        )
+        tokens = []
+        while len(batch):
+            responses = batch.next()
+            tokens.extend(response.token for response in responses)
+        assert responses[-1].finish_reason == "stop"
+
+    assert tokens == [4, 4, 5, 6, 7, 0]
+    assert criteria.thinking_token_count == 3
+    assert not criteria.in_thinking and criteria.pop_forced_token_id() is None
+    assert caches[0][0].tolist() == [[float(sum(tokens[:-1]))]]
+    assert caches[1].offset.tolist() == [2 + len(tokens) - 1]
+    assert not caches[0].is_speculating and not target.transaction.active
+    if sampling != "greedy":
+        assert sampled_positions == [1, 2, 3, 4, 5]
+
+
+def test_mtp_thinking_budget_preserves_target_rng():
+    class RandomDrafter(BudgetDrafter):
+        def draft_block(self, *args, **kwargs):
+            mx.eval(mx.random.uniform(shape=(7,)))
+            return super().draft_block(*args, **kwargs)
+
+    def sample(logits):
+        return mx.random.categorical(logits)
+
+    criteria = budget_criteria(1)
+    criteria(4)
+    expected = [4]
+    mx.random.seed(2741)
+    for _ in range(5):
+        previous = expected[-1]
+        next_token = 7 if previous == 6 else 0 if previous == 7 else 4
+        token = int(sample((mx.eye(8)[next_token] * 9)[None]).item())
+        forced = criteria.pop_forced_token_id()
+        if forced is not None:
+            token = forced
+        criteria(token)
+        expected.append(token)
+    expected_rng = mx.random.uniform(shape=(8,))
+    mx.eval(expected_rng)
+
+    criteria = budget_criteria(1)
+    criteria(4)
+    mx.random.seed(2741)
+    actual = [4] + [
+        token
+        for token, _ in mtp._mtp_rounds(
+            BudgetTarget(),
+            RandomDrafter(),
+            budget_caches(),
+            mx.zeros((1, 1, 8)),
+            {},
+            first_bonus=4,
+            max_tokens=6,
+            sampler=sample,
+            draft_block_size=4,
+            thinking_budget_criteria=criteria,
+        )
+    ]
+    assert actual == expected
+    equal(mx.random.uniform(shape=(8,)), expected_rng)
+
+
+@parametrize("uniform", [False, True])
+@parametrize("limits", [[5, 6], [1, 6]])
+def test_mtp_thinking_budget_batch_limits_and_row_filtering(uniform, limits):
+    target, drafter = BudgetTarget(), BudgetDrafter()
+    drafter.requires_uniform_batch_acceptance = uniform
+    criteria = [budget_criteria(0), budget_criteria(2)]
+    batch = SpeculativeGenerationBatch(
+        target,
+        drafter,
+        "mtp",
+        [100, 200],
+        mx.array([4, 4]),
+        budget_caches(2),
+        greedy,
+        lambda token: token == 0,
+        limits,
+        mx.zeros((2, 1, 8)),
+        {},
+        mx.array([[1, 2], [1, 2]]),
+        draft_block_size=4,
+        greedy_sampling=True,
+        thinking_budget_criteria=criteria,
+    )
+    tokens = {100: [], 200: []}
+    finishes = {}
+    while len(batch):
+        for response in batch.next():
+            tokens[response.uid].append(response.token)
+            if response.finish_reason:
+                finishes[response.uid] = response.finish_reason
+    assert tokens == {
+        100: [4, 5, 6, 7, 0][: limits[0]],
+        200: [4, 4, 4, 5, 6, 7],
+    }
+    assert finishes == {100: "stop" if limits[0] == 5 else "length", 200: "length"}
+    assert criteria[0].thinking_token_count == (2 if limits[0] == 5 else 1)
+    assert criteria[1].thinking_token_count == 4
+
+
+@parametrize(
+    "budget,preopened,enabled,natural_end,first,limit,expected",
+    [
+        (0, True, True, False, 4, 2, [4, 5]),
+        (1, False, True, False, 3, 7, [3, 4, 4, 5, 6, 7, 0]),
+        (0, False, False, False, 4, 4, [4, 4, 4, 4]),
+        (5, True, True, True, 4, 4, [4, 6, 7, 0]),
+    ],
+)
+def test_mtp_thinking_budget_boundaries(
+    budget, preopened, enabled, natural_end, first, limit, expected
+):
+    criteria = budget_criteria(budget, preopened=preopened, enabled=enabled)
+    criteria(first)
+    generator = mtp._mtp_rounds(
+        BudgetTarget(natural_end),
+        BudgetDrafter(),
+        budget_caches(),
+        mx.zeros((1, 1, 8)),
+        {},
+        first_bonus=first,
+        max_tokens=limit,
+        sampler=greedy,
+        draft_block_size=4,
+        greedy_sampling=True,
+        thinking_budget_criteria=criteria,
+        eos_token_ids={0},
+    )
+    assert [first] + [token for token, _ in generator] == expected
 
 
 def test_acceptance_walk_and_budgets():

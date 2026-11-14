@@ -184,9 +184,13 @@ def run_speculative_server_rounds(
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
+    thinking_budget_criteria: Optional[List[Any]] = None,
+    max_tokens_per_row: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
     _validate_speculative_sampling(draft_model, greedy_sampling)
+    if draft_kind != "mtp" and any(thinking_budget_criteria or []):
+        raise ValueError("thinking_budget is only supported with MTP speculation.")
 
     if draft_kind == "eagle3":
         if batch_size == 1:
@@ -242,6 +246,8 @@ def run_speculative_server_rounds(
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
+            thinking_budget_criteria=thinking_budget_criteria,
+            max_tokens_per_row=max_tokens_per_row,
         )
         return
 
@@ -299,17 +305,29 @@ def run_speculative_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     sampler_is_greedy: bool = False,
+    thinking_budget_criteria: Optional[Any] = None,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     B = input_ids.shape[0]
     _validate_speculative_sampling(draft_model, sampler_is_greedy)
+    if thinking_budget_criteria is not None:
+        if draft_kind != "mtp":
+            raise ValueError("thinking_budget is only supported with MTP speculation.")
+        if B != 1:
+            raise ValueError(
+                "Batched thinking_budget requires per-request criteria via the server."
+            )
 
     if draft_kind == "mtp":
         shared_kv_states = last_outputs.shared_kv_states
         hidden = last_outputs.hidden_states[-1]
+        eos = getattr(model.config, "eos_token_id", None)
+        eos_set = {eos} if isinstance(eos, int) else set(eos) if eos else None
         if B == 1:
             _buffer_mtp_target_cache(prompt_cache, draft_model, draft_block_size)
             mx.eval(first_token)
             bonus = first_token.item()
+            if thinking_budget_criteria is not None:
+                thinking_budget_criteria(bonus)
             yield bonus, logprobs
             yield from _mtp_rounds(
                 model,
@@ -324,6 +342,8 @@ def run_speculative_rounds(
                 draft_block_size=draft_block_size,
                 token_dtype=input_ids.dtype,
                 greedy_sampling=sampler_is_greedy,
+                thinking_budget_criteria=thinking_budget_criteria,
+                eos_token_ids=eos_set,
             )
         else:
             mx.eval(first_token)
@@ -331,13 +351,6 @@ def run_speculative_rounds(
                 first_token if first_token.ndim == 1 else first_token.reshape(-1)
             )
             yield first_bonus.tolist(), logprobs
-            eos = getattr(model.config, "eos_token_id", None)
-            if isinstance(eos, int):
-                eos_set = {eos}
-            elif eos is None:
-                eos_set = None
-            else:
-                eos_set = set(int(x) for x in eos)
             yield from _mtp_rounds_batch(
                 model,
                 draft_model,

@@ -1204,9 +1204,13 @@ class ResponseGenerator:
             raise ValueError(
                 "Structured response_format is not supported with speculative decoding."
             )
-        if self.draft_model is not None and args.thinking_budget is not None:
+        if (
+            self.draft_model is not None
+            and args.thinking_budget is not None
+            and self.draft_kind != "mtp"
+        ):
             raise ValueError(
-                "thinking_budget is not supported with speculative decoding in the server."
+                "thinking_budget is only supported with MTP speculative decoding."
             )
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()

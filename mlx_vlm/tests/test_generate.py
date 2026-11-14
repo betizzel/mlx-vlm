@@ -1203,6 +1203,67 @@ class TestThinkingBudgetCriteria:
         assert criteria.pop_forced_token_id() is None
 
 
+def test_stream_generate_mtp_thinking_budget_counted_once(monkeypatch):
+    from mlx_vlm.tests.test_speculative import BudgetDrafter, BudgetTarget, budget_caches
+
+    target, drafter = BudgetTarget(), BudgetDrafter()
+    tokenizer = SimpleNamespace(
+        encode=lambda text, **kw: {"<think>": [3], "</think>": [6], "\n": [5]}[text],
+        stopping_criteria=lambda token: token == 0,
+    )
+
+    class Detokenizer:
+        last_segment = ""
+
+        def reset(self):
+            pass
+
+        def add_token(self, token, skip_special_token_ids=None):
+            self.last_segment = str(token)
+
+        def finalize(self):
+            self.last_segment = ""
+
+    def decode(input_ids, model, pixel_values, mask, **kwargs):
+        yield from ar_module.run_speculative_rounds(
+            model,
+            kwargs["draft_model"],
+            kwargs["prompt_cache"],
+            input_ids,
+            mx.array([4]),
+            None,
+            SimpleNamespace(hidden_states=[mx.zeros((1, 1, 8))], shared_kv_states={}),
+            draft_kind=kwargs["draft_kind"],
+            max_tokens=kwargs["max_tokens"],
+            sampler=lambda logits: mx.argmax(logits, axis=-1),
+            draft_block_size=4,
+            sampler_is_greedy=True,
+            thinking_budget_criteria=kwargs["thinking_budget_criteria"],
+        )
+
+    monkeypatch.setattr(dispatch_module, "generate_step", decode)
+    monkeypatch.setattr(dispatch_module, "wired_limit", lambda *a: contextlib.nullcontext())
+    results = list(
+        dispatch_module.stream_generate(
+            target,
+            SimpleNamespace(tokenizer=tokenizer, detokenizer=Detokenizer()),
+            "",
+            input_ids=mx.array([[1, 3]]),
+            pixel_values=None,
+            mask=None,
+            prompt_cache=budget_caches(),
+            draft_model=drafter,
+            draft_kind="mtp",
+            max_tokens=8,
+            thinking_budget=1,
+            enable_thinking=True,
+        )
+    )
+    assert results[-1].token_ids == [4, 4, 5, 6, 7, 0]
+    assert results[-1].finish_reason == "stop"
+    assert tokenizer.thinking_budget_criteria.thinking_token_count == 3
+
+
 @pytest.mark.parametrize("reused_prefix", [0, 1, 2])
 def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
     class FakeStoppingCriteria:

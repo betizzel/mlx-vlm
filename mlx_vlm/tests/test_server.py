@@ -4749,6 +4749,36 @@ def _step_tokens(tokenizer, responses, *, progress=(), trim_space=True):
 class TestResponseGenerator:
     """Tests for the ResponseGenerator continuous batching engine."""
 
+    @pytest.mark.parametrize("kind", ["mtp", "dflash", "eagle3"])
+    def test_speculative_thinking_budget_guard(self, kind):
+        gen = _ready_generator(
+            draft_model=object(),
+            draft_kind=kind,
+            tokenizer=NS(
+                encode=lambda text, **kw: {
+                    "<think>": [3],
+                    "</think>": [6],
+                    "\n": [5],
+                }[text]
+            ),
+        )
+        gen._preprocess_request = lambda *a, **kw: {"input_ids": mx.array([[1, 3]])}
+        queued = _capture_requests(gen, prompt_tokens=2)
+        args = Args(max_tokens=8, enable_thinking=True, thinking_budget=1)
+        if kind != "mtp":
+            with pytest.raises(ValueError, match="only supported with MTP"):
+                gen.generate("prompt", args=args)
+            assert not queued
+            return
+
+        _, tokens = gen.generate("prompt", args=args)
+        tokens.close()
+        criteria = queued[0].thinking_budget_criteria
+        assert criteria.thinking_budget == 1 and criteria.in_thinking
+        args.logits_processors = [lambda tokens, logits: logits]
+        with pytest.raises(ValueError, match="Structured response_format"):
+            gen.generate("prompt", args=args)
+
     @pytest.mark.parametrize("media", [False, True])
     def test_cache_boundary_matches_tokenized_prefix_and_skips_media(self, media):
         gen = _ready_generator()
