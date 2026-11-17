@@ -3271,12 +3271,24 @@ class APCManager:
             min(limits) if limits else self.memory_max_bytes + self.memory_reserve_bytes
         )
 
-    def _make_room(self, allocation_bytes: int = 0, *, retain_bytes: int = 0) -> bool:
-        """Evict idle APC state before allocating; never alter leased blocks."""
+    def _make_room(
+        self,
+        allocation_bytes: int = 0,
+        *,
+        retain_bytes: int = 0,
+        prefill_reserve: bool = True,
+    ) -> bool:
+        """Evict idle APC state before allocating; never alter leased blocks.
+
+        ``prefill_reserve=False`` leaves the next prefill's reserve out: for a
+        snapshot that replaces a resident checkpoint, whose next request makes
+        room for its own prefill (``prepare_prefill``) before allocating.
+        """
+        prefill = self._prefill_reserve_bytes if prefill_reserve else 0
         required = self.memory_reserve_bytes + (
-            self._prefill_reserve_bytes + allocation_bytes
+            prefill + allocation_bytes
             if retain_bytes
-            else max(self._prefill_reserve_bytes, allocation_bytes)
+            else max(prefill, allocation_bytes)
         )
         with self.lock:
             resident = self._resident_bytes_locked()
@@ -3316,6 +3328,20 @@ class APCManager:
             resident + retain_bytes <= self.memory_max_bytes
             and self._memory_headroom() >= required
         )
+
+    def extends_resident_checkpoint(
+        self, token_ids: Sequence[int], extra_hash: int = 0
+    ) -> bool:
+        """True if a resident exact checkpoint is a strict prefix of
+        ``token_ids``: a snapshot of them continues and replaces it."""
+        tokens = tuple(int(t) for t in token_ids)
+        with self.lock:
+            return any(
+                entry.extra_hash == extra_hash
+                and len(entry.token_ids) < len(tokens)
+                and tokens[: len(entry.token_ids)] == entry.token_ids
+                for entry in self._exact_cache.values()
+            )
 
     def prepare_prefill(self, reserve_bytes: int) -> None:
         """Enforce the coordinator's byte budget before new allocations."""
@@ -3542,8 +3568,14 @@ class APCManager:
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        continues: Optional[bool] = None,
     ) -> bool:
-        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        ``continues``: whether the snapshot extends a resident checkpoint (see
+        ``extends_resident_checkpoint``); computed here when not given. Callers
+        that may evict before storing must decide it first.
+        """
         if len(token_ids) < self.exact_cache_min_tokens:
             return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
@@ -3553,14 +3585,37 @@ class APCManager:
         self._prefill_reserve_bytes = self.memory_plan.observe_cache(
             prompt_cache, len(token_tuple), live_bytes=size
         )
+        if continues is None:
+            continues = self.extends_resident_checkpoint(token_tuple, extra_hash)
         if self.disk is not None:
             self.disk.flush()
+        # A continuation replaces the checkpoint it extends, and the next
+        # request makes room for its own prefill before allocating: don't also
+        # hold that reserve now. With it, a 27B conversation at ~100K tokens
+        # needed 7.8 GB to replace its 2.9 GB checkpoint with ~7 GB free, so
+        # every second turn re-read the whole conversation.
         retain = (
             self._exact_cache_max > 0
             and size <= self.memory_max_bytes
-            and self._make_room(size, retain_bytes=size)
+            and self._make_room(
+                size, retain_bytes=size, prefill_reserve=not continues
+            )
         )
         if not retain:
+            apc_trace(
+                "store",
+                mode="exact",
+                ok=False,
+                reason="memory",
+                token_len=len(token_tuple),
+                continues=continues,
+                size_mb=size >> 20,
+                headroom_mb=self._memory_headroom() >> 20,
+                reserve_mb=self.memory_reserve_bytes >> 20,
+                prefill_reserve_mb=self._prefill_reserve_bytes >> 20,
+                resident_mb=self.resident_bytes() >> 20,
+                max_mb=self.memory_max_bytes >> 20,
+            )
             self._make_room()
             with self.lock:
                 self.stats.memory_skips += 1

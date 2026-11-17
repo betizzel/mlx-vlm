@@ -40,7 +40,11 @@ def _reference(q, qk, qv, scale, mask, group_size):
         mask = mx.arange(T - L, T)[:, None] >= mx.arange(T)[None]
     if mask is not None:
         m = mask.reshape(mask.shape[0] if mask.ndim == 4 else 1, 1, 1, L, T)
-        s = mx.where(m, s, -float("inf")) if m.dtype == mx.bool_ else s + m.astype(mx.float32)
+        s = (
+            mx.where(m, s, -float("inf"))
+            if m.dtype == mx.bool_
+            else s + m.astype(mx.float32)
+        )
     p = mx.softmax(s, axis=-1, precise=True)
     return (p @ mx.expand_dims(v, 2)).reshape(B, n_q, L, D)
 
@@ -161,13 +165,19 @@ def test_prefill_chunk_dequant_sdpa(monkeypatch, mask_kind):
     if mask_kind == "causal":
         mask = "causal"
     else:
-        mask = (mx.arange(T - 64, T)[:, None] >= mx.arange(T)[None]).reshape(1, 1, 64, T)
+        mask = (mx.arange(T - 64, T)[:, None] >= mx.arange(T)[None]).reshape(
+            1, 1, 64, T
+        )
     scale = D**-0.5
 
     monkeypatch.setattr(base, "QUANT_PREFILL_SDPA", True)
-    fused = base.scaled_dot_product_attention(mx.array(q), keys, values, cache, scale, mask)
+    fused = base.scaled_dot_product_attention(
+        mx.array(q), keys, values, cache, scale, mask
+    )
     monkeypatch.setattr(base, "QUANT_PREFILL_SDPA", False)
-    shipped = base.scaled_dot_product_attention(mx.array(q), keys, values, cache, scale, mask)
+    shipped = base.scaled_dot_product_attention(
+        mx.array(q), keys, values, cache, scale, mask
+    )
 
     assert T == 964 and fused.shape == (1, 16, 64, D) and fused.dtype == mx.bfloat16
     ref = _reference(q, keys, values, scale, mask, 64)
