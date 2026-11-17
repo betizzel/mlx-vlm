@@ -1,12 +1,20 @@
-> **This fork (branch `m5pro-qwen27`)** is mlx-vlm 0.7.11 plus three fixes, used to serve Qwen3.8-27B (6-bit, 128K
-> context, native MTP) on a 48 GB Apple Silicon Mac:
+> **This fork (branch `m5pro-qwen27`)** is mlx-vlm 0.7.11 plus the changes below, used to serve Qwen3.8-27B (6-bit,
+> 128K context) and Ornith 1.5 35B-A3B (6-bit, 128K context) on a 48 GB Apple Silicon Mac:
 > 1. Prompt admission no longer keeps the previous KV and recurrent buffers alive through the step's unused lazy
 >    output and logits graphs.
 > 2. `cache_nbytes` no longer under-counts when a freed temporary view's object id is reused; `BatchQuantizedKVCache`
 >    reports its bytes.
 > 3. Native MTP speculation honors thinking budgets.
+> 4. Opt-in attention over a uniform 6-bit KV cache, both off by default. `MLX_VLM_QUANT_DECODE_KERNEL=1`: fused Metal
+>    decode kernels that read each packed K/V row once for all query heads of its KV head (from 1,024 keys).
+>    `MLX_VLM_QUANT_PREFILL_SDPA=1`: prefill attention as dequantize + `mx.fast.scaled_dot_product_attention`, without
+>    materialising the scores. On an M5 Pro, decode with 124.8K tokens of context: Ornith 21.5 → 43.4 tok/s, the 27B
+>    6.04 → 9.60.
+> 5. The exact prefix cache keeps a growing conversation's checkpoint when memory is tight: a snapshot that extends the
+>    resident checkpoint replaces it without also reserving memory for the next prefill. Before, the 27B at ~99K
+>    tokens re-read the whole conversation on every second turn.
 >
-> Each fix comes with regression tests. Upstream: [Neywa-Labs/mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) (MIT).
+> Each change comes with regression tests. Upstream: [Neywa-Labs/mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) (MIT).
 > Fixes 1 and 2 still apply to upstream 0.8.0; upstream 0.8.0 added its own MTP thinking-budget support.
 
 [![Upload Python Package](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml)
