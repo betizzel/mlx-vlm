@@ -1,5 +1,6 @@
 import inspect
 import math
+import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -10,9 +11,21 @@ import numpy as np
 from mlx.utils import tree_map
 from PIL import Image
 
+from ..kernels.quantized_decode_attention import (
+    quantized_decode_attention,
+    quantized_decode_attention_supported,
+)
 from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
 from ..turboquant import _state_length as _turboquant_state_length
 from .cache import create_causal_mask
+
+# Opt in to the fused 6-bit decode attention kernels (mlx_vlm/kernels/
+# quantized_decode_attention.py) for one-token decode over a uniform 6-bit cache.
+QUANT_DECODE_KERNEL = os.environ.get("MLX_VLM_QUANT_DECODE_KERNEL") == "1"
+# Opt in to multi-token (prefill) attention over a uniform quantized cache as
+# dequantize + mx.fast.scaled_dot_product_attention, which never materialises
+# the heads x queries x keys scores that quantized_matmul attention does.
+QUANT_PREFILL_SDPA = os.environ.get("MLX_VLM_QUANT_PREFILL_SDPA") == "1"
 
 
 def load_chat_template(tokenizer, model_path):
@@ -433,6 +446,20 @@ def scaled_dot_product_attention(
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
+        if QUANT_DECODE_KERNEL and quantized_decode_attention_supported(
+            queries, keys, mask, cache.group_size, cache.bits
+        ):
+            return quantized_decode_attention(
+                queries, keys, values, scale, mask, group_size=cache.group_size
+            )
+        if QUANT_PREFILL_SDPA and queries.shape[-2] > 1:
+            return mx.fast.scaled_dot_product_attention(
+                queries,
+                mx.dequantize(*keys, group_size=cache.group_size, bits=cache.bits),
+                mx.dequantize(*values, group_size=cache.group_size, bits=cache.bits),
+                scale=scale,
+                mask=mask,
+            )
         return quantized_scaled_dot_product_attention(
             queries,
             keys,
