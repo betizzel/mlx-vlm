@@ -1,5 +1,6 @@
-> **This fork (branch `m5pro-qwen27`)** is mlx-vlm 0.7.11 plus the changes below, used to serve Qwen3.8-27B (6-bit,
-> 128K context) and Ornith 1.5 35B-A3B (6-bit, 128K context) on a 48 GB Apple Silicon Mac:
+> **This fork (branch `m5pro-tuning`)** is mlx-vlm 0.7.11 plus the changes below, used to serve Qwen3.8-27B (6-bit,
+> 128K context) and Ornith 1.5 35B-A3B (6-bit, 128K context) on a 48 GB Apple Silicon Mac. It was called
+> `m5pro-qwen27` until Ornith's decoding work landed; that name points at the same history. The changes:
 > 1. Prompt admission no longer keeps the previous KV and recurrent buffers alive through the step's unused lazy
 >    output and logits graphs.
 > 2. `cache_nbytes` no longer under-counts when a freed temporary view's object id is reused; `BatchQuantizedKVCache`
