@@ -419,8 +419,12 @@ class APCCoordinator:
         snapshot = snapshot_prompt_cache_row(prompt_cache, batch_idx or 0, clone=False)
         if snapshot is None:
             return False
+        # A row extracted from batch caches is already a contiguous private copy.
         return self.manager.store_exact_cache(
-            token_ids, snapshot, extra_hash=extra_hash
+            token_ids,
+            snapshot,
+            extra_hash=extra_hash,
+            owned=_prompt_cache_is_batch_shaped(prompt_cache),
         )
 
     def commit(

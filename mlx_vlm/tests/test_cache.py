@@ -2673,6 +2673,26 @@ def test_consumed_exact_merge_preserves_retained_apc_snapshots(managers):
         same_arrays(result.state, reference.state)
 
 
+def test_batch_row_checkpoint_survives_later_decode_writes(managers):
+    # A checkpoint of the server's batch caches retains the extracted row
+    # copies themselves (no second copy). Decode steps that then write into the
+    # live batch caches must not change what a later restore returns.
+    manager = managers()
+    rows = [sample("KVCache", 16), sample("RotatingKVCache", 16)]
+    live = [C.BatchKVCache.merge([rows[0]]), C.BatchRotatingKVCache.merge([rows[1]])]
+    before = [c.extract(0) for c in live]
+    tokens = list(range(16))
+    assert coordinate(manager, rows).store_checkpoint(tokens, live)
+    step = mx.full((1, 1, 1, 4), 7.0)
+    for c in live:
+        c.update_and_fetch(step, step)
+    mx.eval([c.state for c in live])
+    restored, count = manager.lookup_exact_cache(tokens + [99])
+    assert count == 16
+    for result, reference in zip(restored, before):
+        same_arrays(result.state, reference.state)
+
+
 @parametrize("kind", ["qsa", "deepseek", "composite", "ring-indexed"])
 def test_disk_custom_state(kind, managers, monkeypatch):
     # This checks serialization, not the host-dependent disk admission guard.

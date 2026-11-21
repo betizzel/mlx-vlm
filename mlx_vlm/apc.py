@@ -3590,8 +3590,13 @@ class APCManager:
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        owned: bool = False,
     ) -> bool:
-        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        ``owned`` marks a snapshot that is already a private copy (a row
+        extracted from batch caches): it is retained as is instead of being
+        copied a second time, which at long contexts is a whole KV cache."""
         if len(token_ids) < self.exact_cache_min_tokens:
             return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
@@ -3627,7 +3632,7 @@ class APCManager:
                 with self.lock:
                     self.stats.exact_stores += 1
             return stored
-        copied = _clone_prompt_cache_for_apc(prompt_cache)
+        copied = list(prompt_cache) if owned else _clone_prompt_cache_for_apc(prompt_cache)
         if copied is None:
             types = [type(c).__name__ for c in prompt_cache]
             logger.warning(
