@@ -207,6 +207,22 @@ def _language_model_quantization_config(model):
     return getattr(module, "make_quantization_config", None)
 
 
+def modelopt_nvfp4_quantization(model, model_path: Path) -> dict:
+    """MLX quantization for the tensors load_model repacks from a ModelOpt NVFP4 export.
+
+    Mixed exports (e.g. Inkling 2 Mini: NVFP4 + MXFP8 experts) describe per-tensor
+    formats in hf_quant_config.json; the model's own reading of it wins.
+    """
+    quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    hf_quant_path = model_path / "hf_quant_config.json"
+    if hf_quant_path.exists() and hasattr(model, "quantization_from_metadata"):
+        with open(hf_quant_path) as f:
+            native_quantization = model.quantization_from_metadata(json.load(f))
+        if native_quantization is not None:
+            quantization = native_quantization
+    return quantization
+
+
 def get_model_type(config: dict) -> Optional[str]:
     """Normalize the architecture declared by a checkpoint without importing it."""
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
@@ -601,15 +617,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             ):
                 # Some ModelOpt MoE exports use fused, underscore-delimited
                 # tensor names handled by the model's sanitizer below.
-                quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
-                # Mixed exports (e.g. Inkling 2 Mini: NVFP4 + MXFP8 experts) describe
-                # per-tensor formats in hf_quant_config.json; prefer the model's reading.
-                hf_quant_path = model_path / "hf_quant_config.json"
-                if hf_quant_path.exists() and hasattr(model, "quantization_from_metadata"):
-                    with open(hf_quant_path) as f:
-                        native_quantization = model.quantization_from_metadata(json.load(f))
-                    if native_quantization is not None:
-                        quantization = native_quantization
+                quantization = modelopt_nvfp4_quantization(model, model_path)
             elif (
                 quant_method == "modelopt"
                 and quantization_config.get("quant_algo") == "MXFP8"

@@ -18,6 +18,7 @@ from .utils import (
     create_model_card,
     fetch_from_hub,
     get_model_path,
+    modelopt_nvfp4_quantization,
     save_config,
     save_weights,
     skip_multimodal_module,
@@ -319,6 +320,21 @@ def convert(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
 
+    # load_model repacks ModelOpt NVFP4 exports into MLX's nvfp4/mxfp8 layout, but
+    # fetch_from_hub returns the source config. Save the repacked layout, or the
+    # converted checkpoint would be re-read as ModelOpt tensors and fail to load.
+    source_files_to_skip = set()
+    source_quantization = config.get("quantization_config")
+    if (
+        "quantization" not in config
+        and isinstance(source_quantization, dict)
+        and source_quantization.get("quant_method") == "modelopt"
+        and source_quantization.get("quant_algo") == "NVFP4"
+    ):
+        quantization = modelopt_nvfp4_quantization(model, model_path)
+        config["quantization"] = config["quantization_config"] = quantization
+        source_files_to_skip.add("hf_quant_config.json")
+
     model_quant_predicate = getattr(model, "quant_predicate", None)
 
     def base_quant_predicate(path, module, **kwargs):
@@ -405,7 +421,8 @@ def convert(
         files = glob.glob(str(model_path / pattern))
         for file in files:
             # Skip the index file - save_weights() already generated the correct one
-            if Path(file).name == "model.safetensors.index.json":
+            name = Path(file).name
+            if name == "model.safetensors.index.json" or name in source_files_to_skip:
                 continue
             _copy_writable_file(file, mlx_path / Path(file).name)
 
@@ -457,7 +474,8 @@ def convert(
         if src.is_dir():
             for pattern in ("*.json", "*.txt", "*.jinja", "*.model"):
                 for f in src.glob(pattern):
-                    if f.name not in ("config.json", "model.safetensors.index.json"):
+                    skip = {"config.json", "model.safetensors.index.json"}
+                    if f.name not in skip | source_files_to_skip:
                         _copy_writable_file(f, mlx_path / f.name)
         print("[INFO] processor lacks save_pretrained; copied processor files verbatim")
 
