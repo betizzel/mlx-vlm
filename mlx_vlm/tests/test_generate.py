@@ -3065,6 +3065,28 @@ def test_apc_admission_separates_long_suffix_and_keeps_fifo_priority(cold):
     assert [s[0] for s in admitted] == [7]
 
 
+def test_apc_prefill_reserve_counts_a_restored_prefix_once():
+    # A follow-up on a long conversation restores the checkpoint (allocated at
+    # the prompt's capacity), so only its short suffix still needs the growth
+    # reserve. Budgeting a cold prefill of the whole prompt again refused 40-token
+    # follow-ups on a 125K-token Inkling 2 Mini conversation.
+    from mlx_vlm.apc_coordinator import PrefillMemoryPlan
+    from mlx_vlm.models.cache import CacheMemory
+
+    plan = PrefillMemoryPlan()
+    plan.observe(
+        [
+            CacheMemory(bytes_per_token=1000.0),
+            CacheMemory(bytes_per_token=1000.0, window_size=1024),
+        ],
+        live_bytes=0,
+    )
+    cold = plan.prepare([100_040], chunk_size=2048)
+    warm = plan.prepare([100_040], chunk_size=2048, prefix_lengths=[100_000])
+    assert cold == 2 * (100_040 + 1024 - 1 + 2048) * 1000
+    assert warm == 2 * 40 * 1000
+
+
 def test_apc_admission_shrinks_batch_and_releases_excluded_leases():
     bg = object.__new__(BatchGenerator)
     bg._wire_stack = None

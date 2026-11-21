@@ -3361,6 +3361,32 @@ class APCManager:
                     boundary = max(boundary, shared)
         return boundary
 
+    def exact_prefix_hint(
+        self, token_ids: Sequence[int], *, extra_hash: int = 0, min_prefix_tokens: int = 0
+    ) -> int:
+        """Longest resident exact-checkpoint prefix of ``token_ids``, without
+        restoring it: sizes the prefill reserve before the lookup copies it."""
+        if self._exact_cache_max <= 0:
+            return 0
+        tokens = tuple(int(t) for t in token_ids)
+        best = 0
+        with self.lock:
+            for entry in self._exact_cache.values():
+                if entry.extra_hash != extra_hash:
+                    continue
+                length = _checkpoint_match_len(
+                    tokens,
+                    entry.token_ids,
+                    len(tokens) - 1,
+                    self.block_size,
+                    _dense_checkpoint_trimmable(
+                        entry.prompt_cache, len(entry.token_ids)
+                    ),
+                )
+                if length > max(best, min_prefix_tokens):
+                    best = length
+        return best
+
     def lookup_exact_cache(
         self,
         token_ids: Sequence[int],
