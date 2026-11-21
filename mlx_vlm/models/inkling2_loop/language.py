@@ -23,6 +23,20 @@ from ..inkling2.language import _attention_residual
 from .config import TextConfig
 
 
+@mx.compile
+def _message_gate(hidden, message, down, forget, gain, eps):
+    hidden = hidden.astype(mx.float32)
+    message = message.astype(mx.float32)
+    gate_input = mx.concatenate(
+        [mx.fast.rms_norm(hidden, None, eps), mx.fast.rms_norm(message, None, eps)],
+        axis=-1,
+    )
+    gate_input = (gate_input.astype(down.dtype) @ down.T).astype(mx.float32)
+    return (1 - mx.tanh(gate_input @ forget.T)) * hidden + mx.tanh(
+        gate_input @ gain.T
+    ) * message
+
+
 class MessageGate(nn.Module):
     """(1 - forget) * hidden + gain * message, gated from both normalized inputs."""
 
@@ -35,6 +49,14 @@ class MessageGate(nn.Module):
         self.message_gate_proj = nn.Linear(rank, config.hidden_size, bias=False)
 
     def __call__(self, hidden, message):
+        projections = (self.down_proj, self.forget_gate_proj, self.message_gate_proj)
+        if all(type(p) is nn.Linear and "bias" not in p for p in projections):
+            # 96 gates run per token: one compiled graph each, and the FP32 copies
+            # of the two rank-64 projections made once instead of every call.
+            forget, gain = self._fp32_weights()
+            return _message_gate(
+                hidden, message, self.down_proj.weight, forget, gain, self.eps
+            )
         hidden = hidden.astype(mx.float32)
         message = message.astype(mx.float32)
         gate_input = mx.concatenate(
@@ -52,6 +74,15 @@ class MessageGate(nn.Module):
         )
         gain = mx.tanh(gate_input @ self.message_gate_proj.weight.astype(mx.float32).T)
         return (1 - forget) * hidden + gain * message
+
+    def _fp32_weights(self):
+        forget, gain = self.forget_gate_proj.weight, self.message_gate_proj.weight
+        cached = getattr(self, "_fp32_cache", None)
+        if cached is None or cached[0] is not forget or cached[1] is not gain:
+            cached = (forget, gain, forget.astype(mx.float32), gain.astype(mx.float32))
+            # A plain attribute: not a parameter, so never saved or loaded.
+            object.__setattr__(self, "_fp32_cache", cached)
+        return cached[2], cached[3]
 
 
 class MessageAttentionResidual(nn.Module):

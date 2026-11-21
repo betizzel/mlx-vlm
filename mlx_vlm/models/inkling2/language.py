@@ -604,7 +604,7 @@ class SparseMoE(nn.Module):
     def __call__(self, x):
         indices, weights = _route(
             x,
-            self.gate_weight,
+            self._fp32_gate_weight(),
             self.e_score_correction_bias,
             self.top_k,
             self.route_scale,
@@ -627,6 +627,17 @@ class SparseMoE(nn.Module):
             # weighting to retain the unsharded FP32 accumulation order.
             out = mx.distributed.all_sum(out, group=self.sharding_group)
         return _combine_routes(out, weights)
+
+    def _fp32_gate_weight(self):
+        """The router scores in FP32 from the BF16 gate: convert it once, not on
+        every one of the 48 layer applications per token."""
+        weight = self.gate_weight
+        cached = getattr(self, "_fp32_gate_cache", None)
+        if cached is None or cached[0] is not weight:
+            cached = (weight, weight.astype(mx.float32))
+            # A plain attribute: not a parameter, so never saved or loaded.
+            object.__setattr__(self, "_fp32_gate_cache", cached)
+        return cached[1]
 
 
 class AttentionResidual(nn.Module):
