@@ -698,12 +698,23 @@ def supported(text_model, h: mx.array, cache) -> bool:
             return False
         if getattr(kv, "is_speculating", False) or getattr(conv, "is_speculating", False):
             return False
-        if getattr(conv, "lengths", None) is not None:
-            return False
-        padding = getattr(conv, "left_padding", None)
-        if padding is not None and int(mx.max(padding)) > 0:
+        if getattr(conv, "_lengths", None) is not None or not _unpadded(conv):
             return False
     return True
+
+
+def _unpadded(conv) -> bool:
+    """Whether a batch row's left padding is all behind it. Padding only shrinks as the cache advances, so its
+    largest value is read from the GPU once per padding array (the server sets a new one per request), not on
+    every step: reading it waits for the step in flight and stalls the pipeline."""
+    base = getattr(conv, "_left_padding", None)
+    if base is None:
+        return True
+    seen = getattr(conv, "_fused_padding", None)
+    if seen is None or seen[0] is not base:
+        seen = (base, int(mx.max(base)))
+        conv._fused_padding = seen
+    return conv._left_padding_advance >= seen[1]
 
 
 def decode_step(text_model, h: mx.array, cache) -> mx.array:
