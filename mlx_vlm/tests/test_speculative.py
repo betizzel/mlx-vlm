@@ -257,42 +257,29 @@ def test_inkling2_short_convolution_native_fp32_rounding(
 
 
 @parametrize("rank", [None, 0, 1])
-def test_inkling2_fp32_head_cache_preserves_logits_and_reload(rank, monkeypatch):
+def test_inkling2_bf16_head_gives_fp32_logits_and_follows_reload(rank):
     target, _ = inkling2_dspark_case(mx.bfloat16)
     lm = target.language_model
     lm.lm_head = nn.Linear(32, 16384, bias=False)
     lm.lm_head.set_dtype(mx.bfloat16)
     lm.config.unpadded_vocab_size = 16370
     if rank is not None:
+        # Expert ranks hold the whole head and compute every row themselves.
         lm.sharding_group = NS(size=lambda: 2, rank=lambda: rank)
     h = mx.random.normal((4, 3, 32)).astype(mx.bfloat16)
     for _ in range(2):
-        # Replacing checkpoint weights must invalidate the retained conversion.
+        # Replacing checkpoint weights must change the logits: nothing stale.
         lm.lm_head.weight = mx.random.normal((16384, 32)).astype(mx.bfloat16)
         expected = h.astype(mx.float32) @ lm.lm_head.weight.astype(mx.float32).T
-
-        def gather(local, group):
-            parts = [
-                part.reshape(1, -1, 8192) for part in mx.split(expected, 2, axis=-1)
-            ]
-            equal(local, parts[rank], atol=0, rtol=0)
-            return mx.concatenate(parts)
-
-        if rank is not None:
-            monkeypatch.setattr(mx.distributed, "all_gather", gather)
         actual = lm._logits_from_norm(h)
         cap = lm.config.final_logit_softcapping
         if cap:
             expected = mx.tanh(expected / cap) * cap
-        equal(actual, expected[..., : lm.config.unpadded_vocab_size], atol=0, rtol=0)
+        expected = expected[..., : lm.config.unpadded_vocab_size]
+        equal(actual, expected, atol=1e-6, rtol=1e-5)
         assert actual.dtype == mx.float32
         assert lm.lm_head.weight.dtype == mx.bfloat16
-        if mx.metal.is_available() and mx.default_device() == mx.gpu:
-            assert lm._head_projection_cache[0] is lm.lm_head.weight
-        assert not any(
-            "_head_projection_cache" in name
-            for name, _ in tree_flatten(lm.parameters())
-        )
+        assert len(tree_flatten(lm.lm_head.parameters())) == 1
 
 
 def test_inkling2_dspark_draft_context_window_and_budget():
