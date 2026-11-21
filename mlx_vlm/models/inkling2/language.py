@@ -421,7 +421,6 @@ class Attention(nn.Module):
             b == length == 1
             and type(kv) in (KVCache, RotatingKVCache)
             and not getattr(kv, "is_speculating", False)
-            and self.sharding_group is None
         ):
             out = self._decode_attention(x, q, k, v, r, kv)
         else:
@@ -453,13 +452,16 @@ class Attention(nn.Module):
         bias = mx.take(rel, mx.minimum(distance, self.rel_extent - 1), axis=-1)
         if size > self.rel_extent:
             bias = mx.where(distance < self.rel_extent, bias, mx.array(0, bias.dtype))
+        sinks = self.sink_proj(x)[0, 0]
+        if self.sharding_group is not None:
+            sinks = sinks[self.head_start : self.head_start + self.n_heads]
         return mx.fast.scaled_dot_product_attention(
             q,
             k,
             v,
             scale=self.head_dim**-0.5,
             mask=bias[None, :, None, :],
-            sinks=self.sink_proj(x)[0, 0].astype(q.dtype),
+            sinks=sinks.astype(q.dtype),
         )
 
     def _masked_attention(self, x, q, k, v, r, kv):
