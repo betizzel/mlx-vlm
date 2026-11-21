@@ -513,19 +513,27 @@ class Attention(nn.Module):
         size = k.shape[2]
         padding = getattr(kv, "left_padding", None)
         if (
-            padding is None
-            and q.dtype == k.dtype == v.dtype == mx.bfloat16
+            q.dtype == k.dtype == v.dtype == mx.bfloat16
             and mx.metal.is_available()
             and mx.default_device() == mx.gpu
         ):
             # Flash attention with the relative bias and the sink computed in
             # the kernel: no [heads, queries, keys] mask and no K/V copies.
-            # Prefill chunks and speculative verify blocks both take it.
+            # Prefill chunks and speculative verify blocks both take it, and so
+            # do the server's batch caches (a turn's prefill on a restored
+            # prefix): a row's left padding is its first valid key. The masked
+            # path below materialises heads x chunk x keys per global layer,
+            # 4 GB for a 2,048-token chunk at 41K keys.
             from .kernels import relative_attention
 
             sinks = self.sink_proj(x)
             if self.sharding_group is not None:
                 sinks = sinks[..., self.head_start : self.head_start + self.n_heads]
+            key_start = (
+                mx.zeros((b,), mx.int32)
+                if padding is None
+                else mx.maximum(padding, 0).astype(mx.int32)
+            )
             out = relative_attention(
                 q,
                 k,
@@ -534,7 +542,7 @@ class Attention(nn.Module):
                 sinks,
                 scale=self.head_dim**-0.5,
                 window=self.sliding,
-                key_start=mx.zeros((b,), mx.int32),
+                key_start=key_start,
             )
             return out.transpose(0, 2, 1, 3)
         mask = banded_additive_mask(

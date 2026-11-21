@@ -126,6 +126,32 @@ def test_bf16_prefill_kernel_matches_cached_decode():
     np.testing.assert_allclose(np.array(stepped), np.array(full), atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize("padding", [0, 3])
+def test_bf16_batch_cache_prefill_matches_plain_cache(padding):
+    # The server prefills a turn on its batch caches (one row, maybe left
+    # padded), in chunks on top of what is already cached. BF16 chunks run the
+    # relative-attention kernel with the row's padding as its first key: the
+    # logits must match the same chunks on plain caches, padding excluded.
+    target, _ = loop_case(mx.bfloat16)
+    lm = target.language_model
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]])
+    plain = lm.make_cache()
+    expected = [lm(ids[:, :6], cache=plain).logits, lm(ids[:, 6:], cache=plain).logits]
+    cache = _make_cache(lm, [padding])
+    prompt = mx.concatenate([mx.zeros((1, padding), mx.int32), ids[:, :6]], axis=1)
+    actual = [
+        lm(prompt, cache=cache).logits[:, padding:],
+        lm(ids[:, 6:], cache=cache).logits,
+    ]
+    for a, e in zip(actual, expected):
+        np.testing.assert_allclose(
+            np.array(a.astype(mx.float32)),
+            np.array(e.astype(mx.float32)),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+
 @pytest.mark.parametrize("keys,start", [(700, 0), (5000, 0), (5000, 700)])
 def test_split_k_decode_attention_matches_sdpa(keys, start):
     # Global layers decode through the split-K kernel past a few thousand keys:
