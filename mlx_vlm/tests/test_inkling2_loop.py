@@ -91,6 +91,33 @@ def test_loop_cached_decode_matches_full():
     )
 
 
+def test_head_logits_are_fp32_for_leading_candidates(monkeypatch):
+    from mlx_vlm.models.inkling2 import language
+
+    monkeypatch.setattr(language, "_HEAD_EXACT", 8)
+    target, _ = loop_case(mx.bfloat16)
+    lm = target.language_model
+    mx.random.seed(3)
+    h = mx.random.normal((1, 3, lm.config.hidden_size)).astype(mx.bfloat16)
+    actual = np.array(lm._logits_from_norm(h))
+    reference = h.astype(mx.float32) @ lm.lm_head.weight.astype(mx.float32).T
+    cap = lm.config.final_logit_softcapping
+    if cap:
+        reference = mx.tanh(reference / cap) * cap
+    reference = np.array(reference[..., : lm.config.unpadded_vocab_size])
+    leading = np.argsort(-reference, axis=-1)[..., :4]
+    np.testing.assert_allclose(
+        np.take_along_axis(actual, leading, -1),
+        np.take_along_axis(reference, leading, -1),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_array_equal(actual.argmax(-1), reference.argmax(-1))
+    # The tail keeps BF16-rounded scores: close, but not the FP32 values.
+    np.testing.assert_allclose(actual, reference, rtol=1e-2, atol=1e-2)
+    assert not np.allclose(actual, reference, rtol=1e-6, atol=1e-6)
+
+
 @pytest.mark.parametrize("retained", [[1, 3], [4, 2], [0, 0]])
 def test_loop_speculative_rollback(retained):
     target, draft = loop_case()

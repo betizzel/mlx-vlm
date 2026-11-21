@@ -38,6 +38,10 @@ from ..switch_layers import SwitchGLU
 from .config import TextConfig, validate_sharding
 
 
+# Candidates per row whose logits are recomputed in FP32 after the BF16 head.
+_HEAD_EXACT = 64
+
+
 @mx.compile
 def l2_clip(x, threshold, scale=None):
     dtype = x.dtype
@@ -818,6 +822,27 @@ class LanguageModel(InklingLanguageModel):
         # casting BF16 scores afterwards loses the accumulator's low bits.
         h = h.astype(self.model.embed_norm.weight.dtype).astype(mx.float32)
         if (
+            not self.training
+            and type(self.lm_head) is nn.Linear
+            and "bias" not in self.lm_head
+            and self.lm_head.weight.dtype == mx.bfloat16
+            and h.ndim == 3
+            and h.shape[0] * h.shape[1] <= 15
+        ):
+            # Decode and verify rows: read the BF16 head once (an FP32 copy
+            # doubles the bytes and the memory), then recompute the leading
+            # candidates exactly in FP32. Greedy picks and the probability mass
+            # that matters keep FP32 logits; the tail keeps BF16-rounded ones.
+            # Expert ranks hold the whole head, so each computes every row
+            # itself: the bytes of half the FP32 copy, and no gather.
+            weight = self.lm_head.weight
+            approx = h.astype(weight.dtype) @ weight.T
+            k = min(_HEAD_EXACT, approx.shape[-1])
+            top = mx.argpartition(-approx, k - 1, axis=-1)[..., :k]
+            rows = mx.take(weight, top, axis=0).astype(mx.float32)
+            exact = (rows * h[..., None, :]).sum(-1)
+            logits = mx.put_along_axis(approx.astype(mx.float32), top, exact, axis=-1)
+        elif (
             not self.training
             and type(self.lm_head) is nn.Linear
             and "bias" not in self.lm_head
