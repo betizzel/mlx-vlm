@@ -417,6 +417,53 @@ class Attention(nn.Module):
             q = (q.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
             r = (r.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
         q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
+        if (
+            b == length == 1
+            and type(kv) in (KVCache, RotatingKVCache)
+            and not getattr(kv, "is_speculating", False)
+            and self.sharding_group is None
+        ):
+            out = self._decode_attention(x, q, k, v, r, kv)
+        else:
+            out = self._masked_attention(x, q, k, v, r, kv)
+        out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
+        out = (
+            out.astype(mx.float32)
+            * mx.sigmoid(self._project(self.gate_proj, x).astype(mx.float32))
+        ).astype(x.dtype)
+        # Every output dot still consumes all heads on one rank. Gather the
+        # heads first, project complete output rows, then restore hidden order.
+        return self._gather_features(
+            self._project(self.o_proj, self._gather_features(out))
+        )
+
+    def _decode_attention(self, x, q, k, v, r, kv):
+        """One query of one sequence: the per-head sink goes to the fused SDPA's
+        `sinks`, so the K/V cache is never copied to append a zero sink row, and
+        the relative bias follows the ring buffer's slots instead of reordering it."""
+        k, v = kv.update_and_fetch(k, v)
+        size = k.shape[2]
+        slots = mx.arange(size)
+        if isinstance(kv, RotatingKVCache):
+            # After an in-place decode write the oldest key sits at the write index.
+            slots = (slots - kv._idx) % size
+        # Every cached key is visible: a sliding cache holds at most its window.
+        distance = (size - 1) - slots
+        rel = r[0, 0] @ self.rel_proj.astype(x.dtype)
+        bias = mx.take(rel, mx.minimum(distance, self.rel_extent - 1), axis=-1)
+        if size > self.rel_extent:
+            bias = mx.where(distance < self.rel_extent, bias, mx.array(0, bias.dtype))
+        return mx.fast.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=self.head_dim**-0.5,
+            mask=bias[None, :, None, :],
+            sinks=self.sink_proj(x)[0, 0].astype(q.dtype),
+        )
+
+    def _masked_attention(self, x, q, k, v, r, kv):
+        b, length = x.shape[:2]
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
             # Relative logits index backward distance, so ring buffers must be
@@ -451,18 +498,8 @@ class Attention(nn.Module):
         v = mx.concatenate(
             [v, mx.zeros((b, self.n_kv, 1, self.head_dim), v.dtype)], axis=2
         )
-        out = mx.fast.scaled_dot_product_attention(
+        return mx.fast.scaled_dot_product_attention(
             q, k, v, scale=self.head_dim**-0.5, mask=mask
-        )
-        out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
-        out = (
-            out.astype(mx.float32)
-            * mx.sigmoid(self._project(self.gate_proj, x).astype(mx.float32))
-        ).astype(x.dtype)
-        # Every output dot still consumes all heads on one rank. Gather the
-        # heads first, project complete output rows, then restore hidden order.
-        return self._gather_features(
-            self._project(self.o_proj, self._gather_features(out))
         )
 
 
