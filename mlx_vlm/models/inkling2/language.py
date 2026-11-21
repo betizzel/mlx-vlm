@@ -38,6 +38,10 @@ from ..switch_layers import SwitchGLU
 from .config import TextConfig, validate_sharding
 
 
+# Global-cache length from which single-query decode uses the split-K kernel.
+_DECODE_KERNEL_MIN_KEYS = 4096
+
+
 @mx.compile
 def l2_clip(x, threshold, scale=None):
     dtype = x.dtype
@@ -442,19 +446,34 @@ class Attention(nn.Module):
         the relative bias follows the ring buffer's slots instead of reordering it."""
         k, v = kv.update_and_fetch(k, v)
         size = k.shape[2]
+        rel = r[0, 0] @ self.rel_proj.astype(x.dtype)
+        sinks = self.sink_proj(x)[0, 0]
+        if self.sharding_group is not None:
+            sinks = sinks[self.head_start : self.head_start + self.n_heads]
+        if (
+            not isinstance(kv, RotatingKVCache)
+            and size >= _DECODE_KERNEL_MIN_KEYS
+            and q.dtype == k.dtype == v.dtype == mx.bfloat16
+            and self.head_dim % 32 == 0
+            and mx.metal.is_available()
+            and mx.default_device() == mx.gpu
+        ):
+            # Long global caches: fused SDPA reads K/V once per query head; the
+            # split-K kernel reads each KV head's keys once for its query heads.
+            from .kernels import decode_attention
+
+            return decode_attention(
+                q, k, v, rel, sinks, scale=self.head_dim**-0.5
+            )
         slots = mx.arange(size)
         if isinstance(kv, RotatingKVCache):
             # After an in-place decode write the oldest key sits at the write index.
             slots = (slots - kv._idx) % size
         # Every cached key is visible: a sliding cache holds at most its window.
         distance = (size - 1) - slots
-        rel = r[0, 0] @ self.rel_proj.astype(x.dtype)
         bias = mx.take(rel, mx.minimum(distance, self.rel_extent - 1), axis=-1)
         if size > self.rel_extent:
             bias = mx.where(distance < self.rel_extent, bias, mx.array(0, bias.dtype))
-        sinks = self.sink_proj(x)[0, 0]
-        if self.sharding_group is not None:
-            sinks = sinks[self.head_start : self.head_start + self.n_heads]
         return mx.fast.scaled_dot_product_attention(
             q,
             k,

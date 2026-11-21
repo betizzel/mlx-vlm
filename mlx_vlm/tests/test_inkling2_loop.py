@@ -107,6 +107,35 @@ def test_bf16_prefill_kernel_matches_cached_decode():
     np.testing.assert_allclose(np.array(stepped), np.array(full), atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize("keys", [700, 5000])
+def test_split_k_decode_attention_matches_sdpa(keys):
+    # Global layers decode through the split-K kernel past a few thousand keys:
+    # it must equal fused SDPA with the relative bias (newest R keys only) as an
+    # additive mask and the query-dependent sink, including a partial last block.
+    from mlx_vlm.models.inkling2.kernels import decode_attention
+
+    mx.random.seed(11)
+    hq, hkv, d, r = 24, 8, 128, 1024
+    q = mx.random.normal((1, hq, 1, d)).astype(mx.bfloat16)
+    k = mx.random.normal((1, hkv, keys, d)).astype(mx.bfloat16)
+    v = mx.random.normal((1, hkv, keys, d)).astype(mx.bfloat16)
+    rel = mx.random.normal((hq, r)).astype(mx.bfloat16)
+    sinks = mx.random.normal((hq,)).astype(mx.bfloat16)
+    distance = (keys - 1) - mx.arange(keys)
+    bias = mx.take(rel, mx.minimum(distance, r - 1), axis=-1)
+    bias = mx.where(distance < r, bias, mx.array(0, bias.dtype))
+    expected = mx.fast.scaled_dot_product_attention(
+        q, k, v, scale=d**-0.5, mask=bias[None, :, None, :], sinks=sinks
+    )
+    actual = decode_attention(q, k, v, rel, sinks, scale=d**-0.5)
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
 @pytest.mark.parametrize("rows", [1, 9])
 def test_bf16_head_logits_are_fp32(rows):
     # Decode (1 row) and DSpark verify rows read the BF16 head without an FP32
