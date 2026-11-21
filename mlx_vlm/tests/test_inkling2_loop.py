@@ -152,6 +152,47 @@ def test_bf16_batch_cache_prefill_matches_plain_cache(padding):
         )
 
 
+@pytest.mark.parametrize("batch_cache", [False, True])
+@pytest.mark.parametrize("prompt", [6, 70])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_fused_decode_matches_reference(dtype, prompt, batch_cache, monkeypatch):
+    # One-token steps run each layer visit in a few kernels (models/inkling2/fused.py). They must give the
+    # reference's logits and leave caches the reference continues from: past the 4-key sliding ring, past the
+    # attend kernel's window for the global layers (64 keys at head_dim 8), on plain and on the server's batch caches.
+    from mlx_vlm.models.inkling2 import fused
+
+    target, _ = loop_case(dtype)
+    lm = target.language_model
+    ids = (mx.arange(prompt + 10) % 60 + 1)[None].astype(mx.int32)
+    supported, steps = fused.supported, []
+
+    def run(use_fused, mixed=False):
+        monkeypatch.setattr(
+            fused,
+            "supported",
+            (lambda *a: steps.append(1) or supported(*a)) if use_fused else (lambda *a: False),
+        )
+        cache = _make_cache(lm, [0]) if batch_cache else lm.make_cache()
+        lm(ids[:, :prompt], cache=cache)
+        out = []
+        for i in range(prompt, prompt + 10):
+            if mixed:  # alternate: each path continues the other's caches
+                monkeypatch.setattr(fused, "supported", supported if i % 2 else (lambda *a: False))
+            out.append(lm(ids[:, i : i + 1], cache=cache).logits.astype(mx.float32))
+        return np.array(mx.concatenate(out, axis=1))
+
+    expected = run(False)
+    actual = run(True)
+    assert steps, "the fused path never ran"
+    alternated = run(True, mixed=True)
+    # FP32: MLX's matrix-matrix products round like TF32 on M5 GPUs (about 1e-2 on a 64-wide dot product; the
+    # matrix-vector ones are exact), and the reference's attention over depth with three queries is one, so it
+    # sits ~5e-4 from the kernels, which sum in FP32 (and match NumPy to 1e-7).
+    tol = 1e-3 if dtype == mx.float32 else 5e-2
+    np.testing.assert_allclose(actual, expected, atol=tol, rtol=tol)
+    np.testing.assert_allclose(alternated, expected, atol=tol, rtol=tol)
+
+
 @pytest.mark.parametrize("keys,start", [(700, 0), (5000, 0), (5000, 700)])
 def test_split_k_decode_attention_matches_sdpa(keys, start):
     # Global layers decode through the split-K kernel past a few thousand keys:

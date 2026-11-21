@@ -13,5 +13,9 @@ This repository is MLX-VLM (https://github.com/Blaizzy/mlx-vlm, MIT License, see
 Inkling 2 Mini is a model by Thinking Machines Lab, Inc., released under the Apache License 2.0 together with the
 Thinking Machines Model Acceptable Use Policy (https://thinkingmachines.ai/model-acceptable-use-policy/).
 
+mlx_vlm/models/inkling2/fused.py carries Metal kernels from Locals (https://github.com/Generated-Computers/Locals,
+locals/inkling.py at commit 0931def8), Copyright 2026 Arip Asadulaev, Apache License 2.0 (see LICENSE-APACHE-2.0);
+its Python side is adapted to this package's modules and caches.
+
 Published by NetProjects (Internet Projects Ltd), https://netprojects.com.
 Not affiliated with Thinking Machines Lab, Hugging Face or the MLX-VLM authors.

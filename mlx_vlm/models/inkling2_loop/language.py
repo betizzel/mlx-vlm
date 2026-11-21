@@ -17,6 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..inkling.language import _cache_padding_mask
+from ..inkling2 import fused
 from ..inkling2.language import AttentionResidual, DecoderLayer
 from ..inkling2.language import LanguageModel as Inkling2LanguageModel
 from ..inkling2.language import _attention_residual
@@ -214,6 +215,10 @@ class TextModel(nn.Module):
         requested = set(capture_layer_ids or [])
         captures = {}
         x = self.embed(inputs) if input_embeddings is None else input_embeddings
+        if capture_layer_ids is None and not speculative_verify and fused.supported(self, x, cache):
+            # One token a row: each layer visit in a few kernels instead of ~125 MLX operations.
+            h = fused.decode_step(self, x, cache)
+            return h if skip_final_norm else self.norm(h).astype(x.dtype)
         start = cfg.loop_layer_index_start
         blocks = []
         pre_loop = None
