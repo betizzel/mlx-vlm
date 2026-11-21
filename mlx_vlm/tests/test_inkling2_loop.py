@@ -91,31 +91,37 @@ def test_loop_cached_decode_matches_full():
     )
 
 
-def test_head_logits_are_fp32_for_leading_candidates(monkeypatch):
-    from mlx_vlm.models.inkling2 import language
+def test_bf16_prefill_kernel_matches_cached_decode():
+    # BF16 prefill runs the relative-attention kernel; BF16 decode steps run the
+    # fused single-query SDPA. 13 tokens wrap the 4-key sliding ring and pass
+    # the global layers' 4-key relative extent.
+    target, _ = loop_case(mx.bfloat16)
+    lm = target.language_model
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]])
+    full = lm(ids, cache=lm.make_cache()).logits.astype(mx.float32)
+    cache = lm.make_cache()
+    parts = [lm(ids[:, :5], cache=cache).logits]
+    for i in range(5, ids.shape[1]):
+        parts.append(lm(ids[:, i : i + 1], cache=cache).logits)
+    stepped = mx.concatenate(parts, axis=1).astype(mx.float32)
+    np.testing.assert_allclose(np.array(stepped), np.array(full), atol=5e-2, rtol=5e-2)
 
-    monkeypatch.setattr(language, "_HEAD_EXACT", 8)
+
+@pytest.mark.parametrize("rows", [1, 9])
+def test_bf16_head_logits_are_fp32(rows):
+    # Decode (1 row) and DSpark verify rows read the BF16 head without an FP32
+    # copy; the logits must still be the FP32 products and sums.
     target, _ = loop_case(mx.bfloat16)
     lm = target.language_model
     mx.random.seed(3)
-    h = mx.random.normal((1, 3, lm.config.hidden_size)).astype(mx.bfloat16)
+    h = mx.random.normal((1, rows, lm.config.hidden_size)).astype(mx.bfloat16)
     actual = np.array(lm._logits_from_norm(h))
     reference = h.astype(mx.float32) @ lm.lm_head.weight.astype(mx.float32).T
     cap = lm.config.final_logit_softcapping
     if cap:
         reference = mx.tanh(reference / cap) * cap
     reference = np.array(reference[..., : lm.config.unpadded_vocab_size])
-    leading = np.argsort(-reference, axis=-1)[..., :4]
-    np.testing.assert_allclose(
-        np.take_along_axis(actual, leading, -1),
-        np.take_along_axis(reference, leading, -1),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    np.testing.assert_array_equal(actual.argmax(-1), reference.argmax(-1))
-    # The tail keeps BF16-rounded scores: close, but not the FP32 values.
-    np.testing.assert_allclose(actual, reference, rtol=1e-2, atol=1e-2)
-    assert not np.allclose(actual, reference, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(actual, reference, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("retained", [[1, 3], [4, 2], [0, 0]])
