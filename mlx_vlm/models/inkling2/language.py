@@ -479,12 +479,12 @@ class Attention(nn.Module):
         if (
             padding is None
             and q.dtype == k.dtype == v.dtype == mx.bfloat16
-            and not getattr(kv, "is_speculating", False)
             and mx.metal.is_available()
             and mx.default_device() == mx.gpu
         ):
             # Flash attention with the relative bias and the sink computed in
             # the kernel: no [heads, queries, keys] mask and no K/V copies.
+            # Prefill chunks and speculative verify blocks both take it.
             from .kernels import relative_attention
 
             sinks = self.sink_proj(x)
