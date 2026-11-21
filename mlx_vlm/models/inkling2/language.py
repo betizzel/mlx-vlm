@@ -22,6 +22,7 @@ import mlx.nn as nn
 from ..base import LanguageModelOutput
 from ..cache import (
     ArraysCache,
+    BatchKVCache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
@@ -40,6 +41,9 @@ from .config import TextConfig, validate_sharding
 
 # Global-cache length from which single-query decode uses the split-K kernel.
 _DECODE_KERNEL_MIN_KEYS = 4096
+# Caches whose single-query decode takes the fused path (the server's batch
+# caches hold one row when it serves one sequence).
+_DECODE_CACHES = (KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache)
 
 
 @mx.compile
@@ -423,7 +427,7 @@ class Attention(nn.Module):
         q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
         if (
             b == length == 1
-            and type(kv) in (KVCache, RotatingKVCache)
+            and type(kv) in _DECODE_CACHES
             and not getattr(kv, "is_speculating", False)
         ):
             out = self._decode_attention(x, q, k, v, r, kv)
@@ -443,15 +447,20 @@ class Attention(nn.Module):
     def _decode_attention(self, x, q, k, v, r, kv):
         """One query of one sequence: the per-head sink goes to the fused SDPA's
         `sinks`, so the K/V cache is never copied to append a zero sink row, and
-        the relative bias follows the ring buffer's slots instead of reordering it."""
+        the relative bias follows the ring buffer's slots instead of reordering it.
+        The server's batch caches (one row) take the same path."""
+        batched = isinstance(kv, (BatchKVCache, BatchRotatingKVCache))
+        rotating = isinstance(kv, (RotatingKVCache, BatchRotatingKVCache))
         k, v = kv.update_and_fetch(k, v)
         size = k.shape[2]
         rel = r[0, 0] @ self.rel_proj.astype(x.dtype)
         sinks = self.sink_proj(x)[0, 0]
         if self.sharding_group is not None:
             sinks = sinks[self.head_start : self.head_start + self.n_heads]
+        # A batch row's left padding fills its oldest slots (none once negative).
+        start = kv.left_padding[:1] if batched else None
         if (
-            not isinstance(kv, RotatingKVCache)
+            not rotating
             and size >= _DECODE_KERNEL_MIN_KEYS
             and q.dtype == k.dtype == v.dtype == mx.bfloat16
             and self.head_dim % 32 == 0
@@ -463,10 +472,16 @@ class Attention(nn.Module):
             from .kernels import decode_attention
 
             return decode_attention(
-                q, k, v, rel, sinks, scale=self.head_dim**-0.5
+                q,
+                k,
+                v,
+                rel,
+                sinks,
+                scale=self.head_dim**-0.5,
+                key_start=None if start is None else mx.maximum(start, 0),
             )
         slots = mx.arange(size)
-        if isinstance(kv, RotatingKVCache):
+        if rotating:
             # After an in-place decode write the oldest key sits at the write index.
             slots = (slots - kv._idx) % size
         # Every cached key is visible: a sliding cache holds at most its window.
@@ -474,6 +489,8 @@ class Attention(nn.Module):
         bias = mx.take(rel, mx.minimum(distance, self.rel_extent - 1), axis=-1)
         if size > self.rel_extent:
             bias = mx.where(distance < self.rel_extent, bias, mx.array(0, bias.dtype))
+        if start is not None:
+            bias = mx.where(slots >= start, bias, mx.array(-mx.inf, bias.dtype))
         return mx.fast.scaled_dot_product_attention(
             q,
             k,

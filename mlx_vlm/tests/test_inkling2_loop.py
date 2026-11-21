@@ -91,6 +91,25 @@ def test_loop_cached_decode_matches_full():
     )
 
 
+@pytest.mark.parametrize("padding", [0, 2])
+def test_loop_batch_cache_decode_matches_full(padding):
+    # The server decodes one sequence on batch caches (BatchKVCache and
+    # BatchRotatingKVCache, one row). Decode steps must match the full forward,
+    # past the 4-key sliding ring, and keep a row's left padding out of reach.
+    target, _ = loop_case()
+    lm = target.language_model
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])
+    full = lm(ids).logits
+    cache = _make_cache(lm, [padding])
+    prompt = mx.concatenate([mx.zeros((1, padding), mx.int32), ids[:, :6]], axis=1)
+    parts = [lm(prompt, cache=cache).logits[:, padding:]]
+    for i in range(6, ids.shape[1]):
+        parts.append(lm(ids[:, i : i + 1], cache=cache).logits)
+    np.testing.assert_allclose(
+        np.array(mx.concatenate(parts, axis=1)), np.array(full), atol=3e-5
+    )
+
+
 def test_bf16_prefill_kernel_matches_cached_decode():
     # BF16 prefill runs the relative-attention kernel; BF16 decode steps run the
     # fused single-query SDPA. 13 tokens wrap the 4-key sliding ring and pass
@@ -107,11 +126,12 @@ def test_bf16_prefill_kernel_matches_cached_decode():
     np.testing.assert_allclose(np.array(stepped), np.array(full), atol=5e-2, rtol=5e-2)
 
 
-@pytest.mark.parametrize("keys", [700, 5000])
-def test_split_k_decode_attention_matches_sdpa(keys):
+@pytest.mark.parametrize("keys,start", [(700, 0), (5000, 0), (5000, 700)])
+def test_split_k_decode_attention_matches_sdpa(keys, start):
     # Global layers decode through the split-K kernel past a few thousand keys:
     # it must equal fused SDPA with the relative bias (newest R keys only) as an
-    # additive mask and the query-dependent sink, including a partial last block.
+    # additive mask and the query-dependent sink, including a partial last block
+    # and a batch row's left padding (whole blocks of it, too).
     from mlx_vlm.models.inkling2.kernels import decode_attention
 
     mx.random.seed(11)
@@ -124,10 +144,13 @@ def test_split_k_decode_attention_matches_sdpa(keys):
     distance = (keys - 1) - mx.arange(keys)
     bias = mx.take(rel, mx.minimum(distance, r - 1), axis=-1)
     bias = mx.where(distance < r, bias, mx.array(0, bias.dtype))
+    bias = mx.where(mx.arange(keys) >= start, bias, mx.array(-mx.inf, bias.dtype))
     expected = mx.fast.scaled_dot_product_attention(
         q, k, v, scale=d**-0.5, mask=bias[None, :, None, :], sinks=sinks
     )
-    actual = decode_attention(q, k, v, rel, sinks, scale=d**-0.5)
+    actual = decode_attention(
+        q, k, v, rel, sinks, scale=d**-0.5, key_start=mx.array([start])
+    )
     np.testing.assert_allclose(
         np.array(actual.astype(mx.float32)),
         np.array(expected.astype(mx.float32)),

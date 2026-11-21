@@ -141,7 +141,7 @@ _DECODE_SIMDGROUPS = 8
 def _decode_partials():
     return mx.fast.metal_kernel(
         name="inkling2_decode_attention_partials",
-        input_names=["q", "k", "v", "rel", "sizes", "scale"],
+        input_names=["q", "k", "v", "rel", "key_start", "sizes", "scale"],
         output_names=["part_max", "part_sum", "part_acc"],
         ensure_row_contiguous=False,
         source=r"""
@@ -154,6 +154,8 @@ def _decode_partials():
         const int S = sizes[0];
         const int start = block * BS;
         const int end = min(start + BS, S);
+        // Keys before key_start are a batch row's left padding.
+        const int first = max(start, key_start[0]);
         const float sc = scale;
 
         float qv[G][E];
@@ -168,7 +170,7 @@ def _decode_partials():
         }
         const device T* k_head = k + g * k_strides[1];
         const device T* v_head = v + g * v_strides[1];
-        for (int j = start + int(sg); j < end; j += SG) {
+        for (int j = first + int(sg); j < end; j += SG) {
             const device T* kp = k_head + size_t(j) * k_strides[2] + lane * E;
             const device T* vp = v_head + size_t(j) * v_strides[2] + lane * E;
             float kv[E], vv[E];
@@ -208,10 +210,12 @@ def _decode_partials():
             float M = -INFINITY;
             for (int s = 0; s < SG; ++s) M = max(M, tm[s][h]);
             float L = 0.0f, A = 0.0f;
-            for (int s = 0; s < SG; ++s) {
-                const float w = metal::exp(tm[s][h] - M);
-                L += tl[s][h] * w;
-                A += ta[s][h][d] * w;
+            if (M > -INFINITY) {  // a block wholly inside the padding has no keys
+                for (int s = 0; s < SG; ++s) {
+                    const float w = metal::exp(tm[s][h] - M);
+                    L += tl[s][h] * w;
+                    A += ta[s][h][d] * w;
+                }
             }
             const int row = block * HQ + g * G + h;
             part_acc[size_t(row) * D + d] = A;
@@ -248,16 +252,19 @@ def _decode_combine():
     )
 
 
-def decode_attention(q, k, v, rel, sinks, *, scale):
+def decode_attention(q, k, v, rel, sinks, *, scale, key_start=None):
     """One query of one sequence over a chronological cache.
 
     q: (1, HQ, 1, D); k, v: (1, HKV, S, D) with the query at the last key;
-    rel: (HQ, R), the bias at backward distances below R; sinks: (HQ,).
+    rel: (HQ, R), the bias at backward distances below R; sinks: (HQ,);
+    key_start: optional (1,) int array, the first valid key (left padding).
     Returns (1, HQ, 1, D) in q's dtype.
     """
     _, hq, _, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
     nblocks = (s + _DECODE_BLOCK - 1) // _DECODE_BLOCK
+    if key_start is None:
+        key_start = mx.zeros((1,), mx.int32)
     common = [("T", q.dtype), ("D", d), ("HQ", hq), ("HKV", hkv)]
     part_max, part_sum, part_acc = _decode_partials()(
         inputs=[
@@ -265,6 +272,7 @@ def decode_attention(q, k, v, rel, sinks, *, scale):
             k,
             v,
             mx.contiguous(rel),
+            key_start.astype(mx.int32),
             mx.array([s], dtype=mx.int32),
             mx.array(scale, dtype=mx.float32),
         ],
