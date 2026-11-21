@@ -476,6 +476,31 @@ class Attention(nn.Module):
                 k, v = mx.roll(k, -kv._idx, axis=2), mx.roll(v, -kv._idx, axis=2)
         size = k.shape[2]
         padding = getattr(kv, "left_padding", None)
+        if (
+            padding is None
+            and q.dtype == k.dtype == v.dtype == mx.bfloat16
+            and not getattr(kv, "is_speculating", False)
+            and mx.metal.is_available()
+            and mx.default_device() == mx.gpu
+        ):
+            # Flash attention with the relative bias and the sink computed in
+            # the kernel: no [heads, queries, keys] mask and no K/V copies.
+            from .kernels import relative_attention
+
+            sinks = self.sink_proj(x)
+            if self.sharding_group is not None:
+                sinks = sinks[..., self.head_start : self.head_start + self.n_heads]
+            out = relative_attention(
+                q,
+                k,
+                v,
+                r @ self.rel_proj.astype(x.dtype),
+                sinks,
+                scale=self.head_dim**-0.5,
+                window=self.sliding,
+                key_start=mx.zeros((b,), mx.int32),
+            )
+            return out.transpose(0, 2, 1, 3)
         mask = banded_additive_mask(
             r,
             self.rel_proj.astype(x.dtype),
