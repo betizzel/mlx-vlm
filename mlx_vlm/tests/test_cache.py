@@ -2924,6 +2924,74 @@ def test_admission_before_allocation(operation, memory_manager, monkeypatch):
     assert manager.stats.memory_skips >= 1
 
 
+@parametrize("continues", [True, False])
+@parametrize("path", ["store", "coordinator"])
+def test_continuation_checkpoint_skips_prefill_reserve(
+    path, continues, managers, monkeypatch
+):
+    """A checkpoint that extends the resident one replaces it without also holding
+    the next prefill's reserve; any other store still holds it. (27B at ~100K:
+    7.8 GB needed with ~7 GB free, so every second turn re-read the prompt.)"""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "1")
+    manager = managers(budget=1 << 30)
+    old_tokens = list(range(64))
+    assert manager.store_exact_cache(old_tokens, [allocated(64)])
+    head = old_tokens if continues else list(range(5000, 5064))
+    new_tokens = head + list(range(1000, 1064))
+    if path == "store":
+        new = [allocated(128)]
+
+        def store():
+            return manager.store_exact_cache(new_tokens, new)
+
+    else:
+        new = [filled(batch_cache("dense"), length=128, heads=1, dim=4)]
+
+        def store():
+            return coordinate(manager, new).store_checkpoint(
+                new_tokens, new, batch_idx=0
+            )
+
+    # Room for the snapshot, not for a prefill reserve of the same size on top.
+    size = P._cache_nbytes(new)
+    monkeypatch.setattr(manager.memory_plan, "observe_cache", lambda *a, **k: size)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: size + size // 4)
+    assert store() == continues
+    if continues:
+        # The replacement is resident: the next request restores all of it.
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 40)
+        assert manager.lookup_exact_cache(new_tokens + [7])[1] == len(new_tokens)
+    else:
+        assert manager.stats.memory_skips >= 1
+
+
+@parametrize("evict", [True, False])
+def test_continuation_evicts_superseded_checkpoint_keeps_side_entry(
+    evict, managers, monkeypatch
+):
+    """APC_EVICT_SUPERSEDED=1, two entries: an agent's side request keeps its own
+    checkpoint while the conversation goes on, because the next turn's checkpoint
+    replaces the turn it extends instead of holding both (a whole cache each) and
+    pushing the side request's out. Off (the default) keeps the earlier turn for
+    an edited last message, and the side request's entry goes."""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    monkeypatch.setenv("APC_EVICT_SUPERSEDED", "1" if evict else "0")
+    manager = managers(budget=1 << 30)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 40)
+    turn = list(range(64))
+    side = list(range(5000, 5032))
+    assert manager.store_exact_cache(turn, [allocated(64)])
+    assert manager.store_exact_cache(side, [allocated(32)])
+    assert manager.lookup_exact_cache(turn + [7])[1] == len(turn)
+    longer = turn + list(range(1000, 1064))
+    assert manager.store_exact_cache(longer, [allocated(128)])
+    resident = sorted(len(e.token_ids) for e in manager._exact_cache.values())
+    kept = side if evict else turn
+    assert resident == sorted([len(kept), len(longer)])
+    assert manager.lookup_exact_cache(kept + [7])[1] == len(kept)
+    assert manager.lookup_exact_cache(longer + [7])[1] == len(longer)
+
+
 def test_accounting_and_eviction(memory_manager, monkeypatch):
     cache = NS(
         state={"kv": mx.ones((2, 3)), "nested": [mx.zeros((4,))]},

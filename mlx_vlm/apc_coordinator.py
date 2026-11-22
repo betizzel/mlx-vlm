@@ -404,15 +404,31 @@ class APCCoordinator:
         from .apc import (
             _cache_nbytes,
             _prompt_cache_is_batch_shaped,
+            apc_trace,
             snapshot_prompt_cache_row,
         )
 
+        # Decide before making room evicts the checkpoint this one continues.
+        continues = self.manager.extends_resident_checkpoint(token_ids, extra_hash)
         # Batch extraction can itself allocate a full row before store_exact_cache
         # decides whether it can afford another retained snapshot.
         if _prompt_cache_is_batch_shaped(prompt_cache):
             if self.manager.disk is not None:
                 self.manager.disk.flush()
-            if not self.manager._make_room(_cache_nbytes(prompt_cache)):
+            if not self.manager._make_room(
+                _cache_nbytes(prompt_cache), prefill_reserve=not continues
+            ):
+                apc_trace(
+                    "store",
+                    mode="exact",
+                    ok=False,
+                    reason="room-before-snapshot",
+                    token_len=len(token_ids),
+                    continues=continues,
+                    size_mb=_cache_nbytes(prompt_cache) >> 20,
+                    headroom_mb=self.manager._memory_headroom() >> 20,
+                    resident_mb=self.manager.resident_bytes() >> 20,
+                )
                 with self.manager.lock:
                     self.manager.stats.memory_skips += 1
                 return False
@@ -425,6 +441,7 @@ class APCCoordinator:
             snapshot,
             extra_hash=extra_hash,
             owned=_prompt_cache_is_batch_shaped(prompt_cache),
+            continues=continues,
         )
 
     def commit(
