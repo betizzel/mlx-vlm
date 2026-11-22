@@ -7251,6 +7251,46 @@ def test_response_template_prefilled_thinking(prefix, text, expected):
     )
 
 
+def test_response_template_cut_off_tool_call_keeps_stream():
+    # Inkling's template parses a tool call's region as JSON. A reply that hits
+    # max_tokens inside the call left the region unclosable: finalize() raised
+    # and the response failed, with or without tools in the request.
+    tokenizer = _MuseResponseTemplateTokenizer()
+    tokenizer.response_template = {
+        "defaults": {"role": "assistant"},
+        "start_anchor_pattern": r"<\|end_message\|>",
+        "fields": {
+            "content": {
+                "close": "<|end_message|>",
+                "content": "text",
+                "content_args": {"strip": False},
+                "join": "",
+                "open_pattern": r"(?:<\|message_model\|>[^<]*)?<\|content_text\|>",
+                "repeats": True,
+            },
+            "tool_calls": {
+                "close": "<|end_message|>",
+                "content": "json",
+                "open_pattern": r"(?:<\|message_model\|>[^<]*)?<\|content_invoke_tool_json\|>",
+                "repeats": True,
+                "transform": {
+                    "function": {"arguments": "{content.args}", "name": "{content.name}"},
+                    "type": "function",
+                },
+            },
+        },
+    }
+    processor = NS(tokenizer=tokenizer)
+    prompt = "<|message_user|><|content_text|>List the files.<|end_message|>"
+    state = server.make_response_stream_state(processor, prompt=prompt)
+    chunks = [
+        "<|message_model|><|content_text|>Looking.",
+        "<|end_message|><|message_model|><|content_invoke_tool_json|>",
+        '{"name":"bash","args":{"command":"ls -la && ls src/ 2',
+    ]
+    assert _thoughts(_feed_thinking(state, chunks, last=True)) == ("", "Looking.")
+
+
 @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("batched", [False, True])

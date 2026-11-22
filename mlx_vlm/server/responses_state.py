@@ -197,7 +197,14 @@ class ResponseTemplateStreamState:
         thinking_closed = False
         events = self.parser.feed(text or "")
         if last:
-            _, final_events = self.parser.finalize()
+            try:
+                _, final_events = self.parser.finalize()
+            except ValueError:
+                # A reply cut off (max_tokens) inside a region whose content is
+                # parsed, such as a tool call's JSON, cannot be closed. The text
+                # split so far stands; with tools, the tool parser judges the call.
+                logger.debug("Response template left a cut-off region", exc_info=True)
+                final_events = []
             events.extend(final_events)
 
         for event in events:
