@@ -15,6 +15,7 @@
 
 
 import math
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -37,6 +38,7 @@ from ..inkling.language import (
 )
 from ..switch_layers import SwitchGLU
 from .config import TextConfig, validate_sharding
+from .kernels import kv8_pack, kv8_unpack
 
 
 # Global-cache length from which single-query decode uses the split-K kernel.
@@ -266,6 +268,9 @@ class Attention(nn.Module):
         self.sliding = config.sliding_window_size if self.is_sliding else 0
         self.rel_extent = self.sliding or config.rel_extent
         self.sharding_group = None
+        # MLX_VLM_INKLING_KV8=1: the global layers' keys and values are cached as int8 rows with one FP32 scale
+        # each (kernels.kv8_pack): 132 bytes a head-token instead of 256, so about twice the context per GB.
+        self.kv8 = not self.is_sliding and os.environ.get("MLX_VLM_INKLING_KV8") == "1"
         self.head_start = 0
         self.q_proj = nn.Linear(
             config.hidden_size, self.n_heads * self.head_dim, bias=False
@@ -451,6 +456,8 @@ class Attention(nn.Module):
         The server's batch caches (one row) take the same path."""
         batched = isinstance(kv, (BatchKVCache, BatchRotatingKVCache))
         rotating = isinstance(kv, (RotatingKVCache, BatchRotatingKVCache))
+        if self.kv8:
+            k, v = kv8_pack(k), kv8_pack(v)
         k, v = kv.update_and_fetch(k, v)
         size = k.shape[2]
         rel = r[0, 0] @ self.rel_proj.astype(x.dtype)
@@ -462,7 +469,9 @@ class Attention(nn.Module):
         if (
             not rotating
             and size >= _DECODE_KERNEL_MIN_KEYS
-            and q.dtype == k.dtype == v.dtype == mx.bfloat16
+            and q.dtype == mx.bfloat16
+            and k.dtype == v.dtype
+            and k.dtype in (mx.bfloat16, mx.int8)
             and self.head_dim % 32 == 0
             and mx.metal.is_available()
             and mx.default_device() == mx.gpu
@@ -480,6 +489,8 @@ class Attention(nn.Module):
                 scale=self.head_dim**-0.5,
                 key_start=None if start is None else mx.maximum(start, 0),
             )
+        if k.dtype == mx.int8:
+            k, v = kv8_unpack(k, q.dtype), kv8_unpack(v, q.dtype)
         slots = mx.arange(size)
         if rotating:
             # After an in-place decode write the oldest key sits at the write index.
@@ -503,6 +514,8 @@ class Attention(nn.Module):
     def _masked_attention(self, x, q, k, v, r, kv):
         b, length = x.shape[:2]
         if kv is not None:
+            if self.kv8:
+                k, v = kv8_pack(k), kv8_pack(v)
             k, v = kv.update_and_fetch(k, v)
             # Relative logits index backward distance, so ring buffers must be
             # read in chronological order (ordinary RoPE attention does not care).
@@ -513,7 +526,9 @@ class Attention(nn.Module):
         size = k.shape[2]
         padding = getattr(kv, "left_padding", None)
         if (
-            q.dtype == k.dtype == v.dtype == mx.bfloat16
+            q.dtype == mx.bfloat16
+            and k.dtype == v.dtype
+            and k.dtype in (mx.bfloat16, mx.int8)
             and mx.metal.is_available()
             and mx.default_device() == mx.gpu
         ):
@@ -545,6 +560,8 @@ class Attention(nn.Module):
                 key_start=key_start,
             )
             return out.transpose(0, 2, 1, 3)
+        if k.dtype == mx.int8:
+            k, v = kv8_unpack(k, q.dtype), kv8_unpack(v, q.dtype)
         mask = banded_additive_mask(
             r,
             self.rel_proj.astype(x.dtype),

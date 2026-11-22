@@ -129,6 +129,29 @@ def head_logits(h, weight):
     )[0]
 
 
+# 8-bit global KV (MLX_VLM_INKLING_KV8): each key or value row (one token, one
+# head) is stored as its D values in int8 followed by their FP32 absmax scale as
+# 4 more int8, so a cache row is one ordinary int8 array of D + 4: the cache
+# classes, batch padding and prefix-cache copies handle it as any other array,
+# at 132 bytes a head-token instead of 256. Keys are L2-clipped and values
+# RMS-normalised, so one scale per row loses about 0.4% of the row's largest
+# value. The decode and prefill kernels read it directly.
+@mx.compile
+def kv8_pack(x):
+    """(..., D) float -> (..., D + 4) int8: the row rounded to int8 by its absmax, then the FP32 scale."""
+    xf = x.astype(mx.float32)
+    scale = mx.max(mx.abs(xf), axis=-1, keepdims=True) / 127.0
+    values = mx.round(xf / mx.maximum(scale, 1e-30)).astype(mx.int8)
+    return mx.concatenate([values, scale.view(mx.int8)], axis=-1)
+
+
+def kv8_unpack(packed, dtype=mx.bfloat16):
+    """The inverse of kv8_pack, for the short paths that read keys as dense arrays."""
+    d = packed.shape[-1] - 4
+    scale = mx.contiguous(packed[..., d:]).view(mx.float32)
+    return (packed[..., :d].astype(mx.float32) * scale).astype(dtype)
+
+
 # Single-query decode attention over a long chronological K/V cache, split over
 # key blocks (flash-decoding). One threadgroup reads each key block of one KV
 # head once for all of that head's query heads (GQA), instead of once per query
@@ -168,15 +191,18 @@ def _decode_partials():
             l[h] = 0.0f;
             for (int e = 0; e < E; ++e) acc[h][e] = 0.0f;
         }
-        const device T* k_head = k + g * k_strides[1];
-        const device T* v_head = v + g * v_strides[1];
+        // PACKED: each key/value row is D int8 values, then their FP32 scale (4 bytes).
+        auto k_head = k + g * k_strides[1];
+        auto v_head = v + g * v_strides[1];
         for (int j = first + int(sg); j < end; j += SG) {
-            const device T* kp = k_head + size_t(j) * k_strides[2] + lane * E;
-            const device T* vp = v_head + size_t(j) * v_strides[2] + lane * E;
+            auto krow = k_head + size_t(j) * k_strides[2];
+            auto vrow = v_head + size_t(j) * v_strides[2];
+            const float ks = PACKED ? *((const device float*)(krow + D)) : 1.0f;
+            const float vs = PACKED ? *((const device float*)(vrow + D)) : 1.0f;
             float kv[E], vv[E];
             for (int e = 0; e < E; ++e) {
-                kv[e] = float(kp[e]);
-                vv[e] = float(vp[e]);
+                kv[e] = float(krow[lane * E + e]) * ks;
+                vv[e] = float(vrow[lane * E + e]) * vs;
             }
             const int dist = S - 1 - j;
             for (int h = 0; h < G; ++h) {
@@ -255,10 +281,10 @@ def _decode_combine():
 def decode_attention(q, k, v, rel, sinks, *, scale, key_start=None):
     """One query of one sequence over a chronological cache.
 
-    q: (1, HQ, 1, D); k, v: (1, HKV, S, D) with the query at the last key;
-    rel: (HQ, R), the bias at backward distances below R; sinks: (HQ,);
-    key_start: optional (1,) int array, the first valid key (left padding).
-    Returns (1, HQ, 1, D) in q's dtype.
+    q: (1, HQ, 1, D); k, v: (1, HKV, S, D) with the query at the last key, or
+    int8 rows of D + 4 from kv8_pack; rel: (HQ, R), the bias at backward
+    distances below R; sinks: (HQ,); key_start: optional (1,) int array, the
+    first valid key (left padding). Returns (1, HQ, 1, D) in q's dtype.
     """
     _, hq, _, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
@@ -266,6 +292,7 @@ def decode_attention(q, k, v, rel, sinks, *, scale, key_start=None):
     if key_start is None:
         key_start = mx.zeros((1,), mx.int32)
     common = [("T", q.dtype), ("D", d), ("HQ", hq), ("HKV", hkv)]
+    packed = k.dtype == mx.int8
     part_max, part_sum, part_acc = _decode_partials()(
         inputs=[
             mx.contiguous(q.reshape(hq, d)),
@@ -277,7 +304,7 @@ def decode_attention(q, k, v, rel, sinks, *, scale, key_start=None):
             mx.array(scale, dtype=mx.float32),
         ],
         template=[*common, ("REL", rel.shape[-1]), ("BS", _DECODE_BLOCK),
-                  ("SG", _DECODE_SIMDGROUPS)],
+                  ("SG", _DECODE_SIMDGROUPS), ("PACKED", packed)],
         grid=(nblocks * 32 * _DECODE_SIMDGROUPS, hkv, 1),
         threadgroup=(32 * _DECODE_SIMDGROUPS, 1, 1),
         output_shapes=[(nblocks * hq,), (nblocks * hq,), (nblocks * hq, d)],
@@ -358,8 +385,8 @@ _RELATIVE_ATTENTION_SOURCE = """
     const int last_diag = S - L + min(q0 + BQ, L) - 1;
     int first_key = WINDOW > 0 ? max(0, first_diag - WINDOW + 1) : 0;
     first_key = max(first_key, start);
-    const device T* k_head = k + batch * k_strides[0] + kv_head * k_strides[1];
-    const device T* v_head = v + batch * v_strides[0] + kv_head * v_strides[1];
+    auto k_head = k + batch * k_strides[0] + kv_head * k_strides[1];
+    auto v_head = v + batch * v_strides[0] + kv_head * v_strides[1];
 
     for (int k0 = first_key / BK * BK; k0 <= last_diag; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -367,19 +394,40 @@ _RELATIVE_ATTENTION_SOURCE = """
             const int r = c / (D / 8);
             const int col = (c % (D / 8)) * 8;
             const int key = k0 + r;
-            vec<T, 4> kv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
-            vec<T, 4> vv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
+            float kf[8], vf[8];
+            for (int j = 0; j < 8; ++j) {
+                kf[j] = 0.0f;
+                vf[j] = 0.0f;
+            }
             if (key < S) {
-                auto kp = (const device vec<T, 4>*)(k_head + key * k_strides[2] + col);
-                auto vp = (const device vec<T, 4>*)(v_head + key * v_strides[2] + col);
-                kv[0] = kp[0];
-                kv[1] = kp[1];
-                vv[0] = vp[0];
-                vv[1] = vp[1];
+                auto krow = k_head + key * k_strides[2];
+                auto vrow = v_head + key * v_strides[2];
+                if (PACKED) {
+                    // D int8 values, then the row's FP32 scale (kv8_pack)
+                    const float ks = *((const device float*)(krow + D));
+                    const float vs = *((const device float*)(vrow + D));
+                    const char4 ka = *((const device char4*)(krow + col));
+                    const char4 kb = *((const device char4*)(krow + col + 4));
+                    const char4 va = *((const device char4*)(vrow + col));
+                    const char4 vb = *((const device char4*)(vrow + col + 4));
+                    for (int j = 0; j < 4; ++j) {
+                        kf[j] = float(ka[j]) * ks;
+                        kf[j + 4] = float(kb[j]) * ks;
+                        vf[j] = float(va[j]) * vs;
+                        vf[j + 4] = float(vb[j]) * vs;
+                    }
+                } else {
+                    auto kp = (const device vec<T, 4>*)(krow + col);
+                    auto vp = (const device vec<T, 4>*)(vrow + col);
+                    for (int j = 0; j < 8; ++j) {
+                        kf[j] = float(kp[j / 4][j % 4]);
+                        vf[j] = float(vp[j / 4][j % 4]);
+                    }
+                }
             }
             for (int j = 0; j < 8; ++j) {
-                Ks[(col + j) * LDK + r] = half(float(kv[j / 4][j % 4]));
-                Vs[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
+                Ks[(col + j) * LDK + r] = half(kf[j]);
+                Vs[r * LDV + col + j] = half(vf[j]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -473,10 +521,10 @@ def relative_attention(
     window: int,
     key_start: mx.array,
 ) -> mx.array:
-    """q: (B, Hq, L, D), k and v: (B, Hkv, S, D), all bfloat16, with the queries
-    at the last L keys. rel: (B, L, Hq, R), the bias at distances below R.
-    sinks: (B, L, Hq). key_start: (B,), the first key of each row. Returns
-    (B, L, Hq, D)."""
+    """q: (B, Hq, L, D) bfloat16; k and v: (B, Hkv, S, D) bfloat16, or int8 rows of
+    D + 4 from kv8_pack; the queries at the last L keys. rel: (B, L, Hq, R), the
+    bias at distances below R. sinks: (B, L, Hq). key_start: (B,), the first key
+    of each row. Returns (B, L, Hq, D)."""
     B, Hq, L, D = q.shape
     Hkv, S = k.shape[1], k.shape[2]
     return _relative_attention_kernel(
@@ -499,6 +547,7 @@ def relative_attention(
             ("WINDOW", window),
             ("BQ", _BQ),
             ("TG", _TG),
+            ("PACKED", k.dtype == mx.int8),
         ],
         grid=((L + _BQ - 1) // _BQ * _TG, Hq, B),
         threadgroup=(_TG, 1, 1),

@@ -34,6 +34,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..cache import ArraysCache, BatchKVCache, BatchRotatingKVCache, KVCache, RotatingKVCache
+from .kernels import kv8_pack, kv8_unpack
 
 _F32 = mx.float32
 _KV = (KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache)
@@ -799,6 +800,8 @@ def _long_attention(A, qo, keys, values, bias, sinks, kv):
             scale=A.head_dim**-0.5,
             key_start=None if start is None else mx.maximum(start, 0),
         )
+    if keys.dtype == mx.int8:  # 1,024–4,096 keys: fused SDPA reads dense rows
+        keys, values = kv8_unpack(keys, q.dtype), kv8_unpack(values, q.dtype)
     distance = (size - 1) - mx.arange(size)
     rel = mx.take(bias, mx.minimum(distance, A.rel_extent - 1), axis=-1)
     rel = mx.where(distance < A.rel_extent, rel, mx.array(0, rel.dtype))
@@ -878,9 +881,13 @@ def _visit(layer, c: _Consts, cfg, x, blocks, kv, conv, messages):
         rel_threshold=cfg.rel_l2_clip_threshold,
         eps=cfg.rms_norm_eps,
     )
+    if A.kv8:
+        ko, vo = kv8_pack(ko), kv8_pack(vo)
     keys, values = kv.update_and_fetch(ko, vo)
     S = keys.shape[2]
     if S <= window(qo.shape[-1]):
+        if keys.dtype == mx.int8:  # a global layer's first keys: the attend kernel reads dense rows
+            keys, values = kv8_unpack(keys, qo.dtype), kv8_unpack(values, qo.dtype)
         idx = kv._idx if isinstance(kv, (RotatingKVCache, BatchRotatingKVCache)) else 0
         counts = mx.minimum(kv.offset, S).astype(mx.int32) if batch else _small(mx.int32, (S,) * M)
         a = attend(qo, keys, values, bias, sinks, gate, idx, counts, A.head_dim**-0.5, gate_at, A.sliding)

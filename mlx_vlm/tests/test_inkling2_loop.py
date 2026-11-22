@@ -289,6 +289,77 @@ def test_split_k_decode_attention_matches_sdpa(keys, start):
     )
 
 
+@pytest.mark.parametrize("keys,start", [(5000, 0), (5000, 700)])
+def test_kv8_kernels_read_packed_rows(keys, start):
+    # MLX_VLM_INKLING_KV8 caches the global layers' rows as int8 plus one FP32 scale each (kv8_pack). The split-K
+    # decode kernel and the prefill kernel read those rows directly: they must give what they give on the same rows
+    # dequantized (and stay close to the unquantized cache), with a batch row's left padding.
+    from mlx_vlm.models.inkling2.kernels import (
+        decode_attention,
+        kv8_pack,
+        kv8_unpack,
+        relative_attention,
+    )
+
+    mx.random.seed(5)
+    hq, hkv, d, r = 24, 8, 128, 64
+    k = (mx.random.normal((1, hkv, keys, d)) * 0.5).astype(mx.bfloat16)
+    v = mx.random.normal((1, hkv, keys, d)).astype(mx.bfloat16)
+    kp, vp = kv8_pack(k), kv8_pack(v)
+    assert kp.dtype == mx.int8 and kp.shape[-1] == d + 4
+    kd, vd = kv8_unpack(kp), kv8_unpack(vp)
+    start_arr = mx.array([start])
+
+    q = mx.random.normal((1, hq, 1, d)).astype(mx.bfloat16)
+    rel = mx.random.normal((hq, r)).astype(mx.bfloat16)
+    sinks = mx.random.normal((hq,)).astype(mx.bfloat16)
+    packed = decode_attention(q, kp, vp, rel, sinks, scale=d**-0.5, key_start=start_arr)
+    dense = decode_attention(q, kd, vd, rel, sinks, scale=d**-0.5, key_start=start_arr)
+    full = decode_attention(q, k, v, rel, sinks, scale=d**-0.5, key_start=start_arr)
+    as_np = lambda a: np.array(a.astype(mx.float32))
+    np.testing.assert_allclose(as_np(packed), as_np(dense), atol=1e-2)
+    np.testing.assert_allclose(as_np(packed), as_np(full), atol=2e-2)
+
+    n = 64
+    qs = mx.random.normal((1, hq, n, d)).astype(mx.bfloat16)
+    rels = mx.random.normal((1, n, hq, r)).astype(mx.bfloat16)
+    sinks_n = mx.random.normal((1, n, hq))
+    args = dict(scale=d**-0.5, window=0, key_start=start_arr)
+    packed = relative_attention(qs, kp, vp, rels, sinks_n, **args)
+    dense = relative_attention(qs, kd, vd, rels, sinks_n, **args)
+    full = relative_attention(qs, k, v, rels, sinks_n, **args)
+    np.testing.assert_allclose(as_np(packed), as_np(dense), atol=1e-2)
+    np.testing.assert_allclose(as_np(packed), as_np(full), atol=3e-2)
+
+
+@pytest.mark.parametrize("batch_cache", [False, True])
+def test_kv8_caches_global_layers_as_int8_rows(batch_cache, monkeypatch):
+    # With MLX_VLM_INKLING_KV8=1 the global layers cache int8 rows (sliding layers stay BF16), the fused step and the
+    # reference read them alike, and the logits stay near those of the BF16 cache.
+    from mlx_vlm.models.inkling2 import fused
+
+    ids = (mx.arange(90) % 60 + 1)[None].astype(mx.int32)
+    supported = fused.supported
+
+    def run(kv8, use_fused):
+        monkeypatch.setenv("MLX_VLM_INKLING_KV8", "1" if kv8 else "0")
+        target, _ = loop_case(mx.bfloat16)
+        lm = target.language_model
+        monkeypatch.setattr(fused, "supported", supported if use_fused else (lambda *a: False))
+        cache = _make_cache(lm, [0]) if batch_cache else lm.make_cache()
+        out = [lm(ids[:, :70], cache=cache).logits[:, -1:]]
+        out += [lm(ids[:, i : i + 1], cache=cache).logits for i in range(70, 90)]
+        dtypes = {c[0].keys.dtype for c in cache if getattr(c[0], "keys", None) is not None}
+        return np.array(mx.concatenate(out, axis=1).astype(mx.float32)), dtypes
+
+    plain, plain_dtypes = run(False, True)
+    fused_kv8, dtypes = run(True, True)
+    reference_kv8, _ = run(True, False)
+    assert plain_dtypes == {mx.bfloat16} and dtypes == {mx.bfloat16, mx.int8}
+    np.testing.assert_allclose(fused_kv8, reference_kv8, atol=5e-2, rtol=5e-2)
+    np.testing.assert_allclose(fused_kv8, plain, atol=1e-1, rtol=1e-1)
+
+
 @pytest.mark.parametrize("rows", [1, 9])
 def test_bf16_head_logits_are_fp32(rows):
     # Decode (1 row) and DSpark verify rows read the BF16 head without an FP32
