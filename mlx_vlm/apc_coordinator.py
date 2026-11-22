@@ -8,15 +8,178 @@ coordinator, adapted to MLX's contiguous runtime cache objects.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import Any, Callable, List, Optional, Sequence, Tuple
+
+import mlx.core as mx
 
 from .apc_adapters import (
     PrefixCachePlan,
     build_prefix_cache_plan,
+    build_prefix_cache_plan_from_caches,
     cache_memory_components,
+    clone_cache_entry,
 )
-from .models.cache import CacheMemory
+from .models.cache import BatchKVCache, CacheList, CacheMemory, KVCache
+
+logger = logging.getLogger(__name__)
+
+
+class _NotDeferrable(Exception):
+    pass
+
+
+class _RowPrefix:
+    """The first ``n`` tokens of one row of an append-only K/V cache."""
+
+    __slots__ = ("n",)
+
+    def __init__(self, n: int):
+        self.n = n
+
+
+def _defer_entry(c: Any, idx: int, n: int, eval_targets: List[mx.array]) -> Any:
+    if isinstance(c, CacheList):
+        return CacheList(*(_defer_entry(ch, idx, n, eval_targets) for ch in c.caches))
+    # Exact types: positions before the boundary are never rewritten.
+    if type(c) is BatchKVCache and c.keys is not None:
+        if c._idx - int(c.left_padding[idx].item()) != n:
+            raise _NotDeferrable
+        return _RowPrefix(n)
+    if type(c) is KVCache and c.keys is not None:
+        if idx != 0 or c.offset != n:
+            raise _NotDeferrable
+        return _RowPrefix(n)
+    # A sliding window or recurrent state moves on: copy it now (it is small).
+    extract = getattr(c, "extract", None)
+    row = (
+        extract(idx)
+        if callable(extract)
+        else clone_cache_entry(c, min_capacity_tokens=None, eval_targets=eval_targets)
+    )
+    if row is None:
+        raise _NotDeferrable
+    eval_targets.extend(a for a in _arrays(row.state))
+    return row
+
+
+def _arrays(tree: Any):
+    if isinstance(tree, mx.array):
+        yield tree
+    elif isinstance(tree, (list, tuple)):
+        for t in tree:
+            yield from _arrays(t)
+
+
+def _prefix_bytes(live: Any, tmpl: Any) -> int:
+    if isinstance(tmpl, CacheList):
+        return sum(_prefix_bytes(l, t) for l, t in zip(live.caches, tmpl.caches))
+    if not isinstance(tmpl, _RowPrefix) or live.keys is None:
+        return 0
+    per_token = (live.keys[0, :, 0].nbytes + live.values[0, :, 0].nbytes)
+    return per_token * tmpl.n
+
+
+def _finish_entry(live: Any, tmpl: Any, idx: int, release: bool) -> Any:
+    if isinstance(tmpl, CacheList):
+        if not isinstance(live, CacheList) or len(live.caches) != len(tmpl.caches):
+            raise _NotDeferrable
+        return CacheList(
+            *(_finish_entry(l, t, idx, release) for l, t in zip(live.caches, tmpl.caches))
+        )
+    if not isinstance(tmpl, _RowPrefix):
+        return tmpl
+    # The row may have been merged into a batch (or the batch filtered) since.
+    if type(live) is BatchKVCache:
+        start, end = int(live.left_padding[idx].item()), live._idx
+    elif type(live) is KVCache and idx == 0:
+        start, end = 0, live.offset
+    else:
+        raise _NotDeferrable
+    if live.keys is None or start < 0 or start + tmpl.n > end:
+        raise _NotDeferrable
+    out = KVCache()
+    out.keys = mx.contiguous(live.keys[idx : idx + 1, :, start : start + tmpl.n])
+    out.values = mx.contiguous(live.values[idx : idx + 1, :, start : start + tmpl.n])
+    out.offset = tmpl.n
+    mx.eval(out.keys, out.values)
+    if release:
+        # Layer by layer: the snapshot replaces the live cache as it is built.
+        live.keys = live.values = None
+    return out
+
+
+class DeferredCheckpoint:
+    """A prefill checkpoint whose dense K/V is still the request's (APC_SINGLE_COPY).
+
+    Only the state that moves on (a sliding window, recurrent or convolution
+    state) is copied at the boundary. The append-only K/V rows are read from
+    the live cache when the row leaves the batch; when it is the batch's last
+    row (``release``), each layer's buffers are freed as its snapshot is made,
+    so the turn never holds a second copy of the context.
+    """
+
+    def __init__(self, coordinator, token_ids, extra_hash, template):
+        self.coordinator = coordinator
+        self.token_ids = list(token_ids)
+        self.extra_hash = extra_hash
+        self.template = template
+
+    def finish(self, prompt_cache: Sequence[Any], batch_idx: int, *, release: bool) -> bool:
+        from .apc import apc_trace
+
+        manager = self.coordinator.manager
+        continues = manager.extends_resident_checkpoint(self.token_ids, self.extra_hash)
+        if len(prompt_cache) != len(self.template):
+            return False
+        if not release:
+            # The batch keeps its rows: this snapshot is a copy.
+            size = sum(_prefix_bytes(l, t) for l, t in zip(prompt_cache, self.template))
+            if not manager._make_room(size, prefill_reserve=not continues):
+                apc_trace("store", mode="deferred", ok=False, reason="room",
+                          token_len=len(self.token_ids), size_mb=size >> 20)
+                with manager.lock:
+                    manager.stats.memory_skips += 1
+                return False
+        try:
+            snapshot = [
+                _finish_entry(live, tmpl, batch_idx, release)
+                for live, tmpl in zip(prompt_cache, self.template)
+            ]
+        except _NotDeferrable:
+            return False
+        apc_trace("store", mode="deferred", release=release, token_len=len(self.token_ids))
+        return manager.store_exact_cache(
+            self.token_ids,
+            snapshot,
+            extra_hash=self.extra_hash,
+            owned=True,
+            continues=continues,
+            allocated=True,
+        )
+
+
+def finish_deferred_checkpoints(
+    deferred: Sequence[DeferredCheckpoint],
+    prompt_cache: Sequence[Any],
+    batch_idx: int,
+    *,
+    release: bool,
+) -> None:
+    """Store a leaving row's deferred checkpoints, the longest last (it may take
+    the row's buffers). With APC_EVICT_SUPERSEDED the longest would evict the
+    others at once, so only it is stored."""
+    ordered = sorted(deferred, key=lambda d: len(d.token_ids))
+    if not ordered:
+        return
+    if ordered[-1].coordinator.manager.evict_superseded:
+        ordered = ordered[-1:]
+    for i, d in enumerate(ordered):
+        try:
+            d.finish(prompt_cache, batch_idx, release=release and i == len(ordered) - 1)
+        except Exception as e:  # a lost checkpoint must not fail the request
+            logger.warning("APC deferred checkpoint store failed: %s", e)
 
 
 class PrefillMemoryPlan:
@@ -347,6 +510,13 @@ class APCCoordinator:
             ):
                 from .apc import APCAdmissionError
 
+                for pick in picks:  # the request waits: its checkpoints go back
+                    if pick is not None and pick.get("warm_cache") is not None:
+                        self.manager.return_taken(
+                            pick["full_input_ids"][: pick["prefix_len"]],
+                            pick["warm_cache"],
+                            pick.get("extra_hash", 0),
+                        )
                 raise APCAdmissionError("APC batch merge deferred by memory admission")
 
         if self.is_checkpoint:
@@ -390,6 +560,35 @@ class APCCoordinator:
             with self.manager.lock:
                 self.manager.stats.restored_tokens += hit["prefix_len"]
         return warm_cache
+
+    def defer_checkpoint(
+        self,
+        token_ids: Sequence[int],
+        prompt_cache: Sequence[Any],
+        *,
+        extra_hash: int = 0,
+        batch_idx: int = 0,
+    ) -> Optional[DeferredCheckpoint]:
+        """With APC_SINGLE_COPY, a checkpoint of the first ``len(token_ids)``
+        tokens of a row to store when the row leaves (``DeferredCheckpoint``),
+        or None: store it now with ``store_checkpoint``."""
+        if not (self.enabled and self.is_checkpoint and self.manager.single_copy):
+            return None
+        if len(token_ids) < self.manager.exact_cache_min_tokens:
+            return None
+        if not build_prefix_cache_plan_from_caches(prompt_cache).restorable:
+            return None
+        eval_targets: List[mx.array] = []
+        try:
+            template = [
+                _defer_entry(c, batch_idx, len(token_ids), eval_targets)
+                for c in prompt_cache
+            ]
+        except _NotDeferrable:
+            return None
+        if eval_targets:
+            mx.eval(eval_targets)
+        return DeferredCheckpoint(self, token_ids, extra_hash, template)
 
     def store_checkpoint(
         self,

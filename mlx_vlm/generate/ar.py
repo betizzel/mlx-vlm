@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 from .. import apc as _apc
 from .._generation_stream import on_generation_stream
+from ..apc_coordinator import finish_deferred_checkpoints as _finish_deferred_checkpoints
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
@@ -1147,6 +1148,8 @@ class GenerationBatch:
 
         # Per-sequence MRoPE delta
         self._rope_deltas = None
+        # Per row: APC checkpoints to store from its cache when it leaves.
+        self.apc_deferred: List[list] = []
 
     def __len__(self):
         return len(self.uids)
@@ -1347,11 +1350,18 @@ class GenerationBatch:
         ):
             raise ValueError("This model does not support continuation cache snapshots")
         self._eval_pending_state()
+        if index < len(self.apc_deferred) and self.apc_deferred[index]:
+            # The detached row's cache is a copy: store its checkpoints now.
+            _finish_deferred_checkpoints(
+                self.apc_deferred[index], self.prompt_cache, index, release=False
+            )
+            self.apc_deferred[index] = []
         caches = _apc.snapshot_prompt_cache_row(self.prompt_cache, index)
         if caches is None:
             raise ValueError("This model does not support continuation cache snapshots")
         row = copy.copy(self)
         row.prompt_cache = caches
+        row.apc_deferred = []
         for name in (
             "uids",
             "max_tokens",
@@ -1406,6 +1416,10 @@ class GenerationBatch:
             self.logits_processors = []
             other.logits_processors = []
 
+        if self.apc_deferred or other.apc_deferred:
+            self.apc_deferred = (
+                self.apc_deferred or [[] for _ in self.uids]
+            ) + (other.apc_deferred or [[] for _ in other.uids])
         self.uids.extend(other.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
         self.max_tokens.extend(other.max_tokens)
@@ -1455,6 +1469,15 @@ class GenerationBatch:
         """Filter the batch to keep only the specified indices."""
         if len(keep) < len(self.uids):
             self._eval_pending_state()
+        if self.apc_deferred:
+            kept = set(keep)
+            for idx, rows in enumerate(self.apc_deferred):
+                if rows and idx not in kept:
+                    # A leaving row: with no row left its buffers become the checkpoint.
+                    _finish_deferred_checkpoints(
+                        rows, self.prompt_cache, idx, release=not keep
+                    )
+            self.apc_deferred = [self.apc_deferred[idx] for idx in keep]
 
         self.uids = [self.uids[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
@@ -1594,6 +1617,7 @@ class GenerationBatch:
         batch._next_top_idx = None
         batch._next_top_lp = None
         batch._rope_deltas = None
+        batch.apc_deferred = []
         return batch
 
 
@@ -2074,6 +2098,21 @@ class PromptProcessingBatch:
 
         if warm_cache is not None:
             self.prompt_cache = warm_cache
+            # APC_SINGLE_COPY took the restored checkpoint out of the store: it
+            # goes back when the row leaves, unless a longer one replaces it.
+            if apc_coordinator is not None and not any(right_pad_per_row or ()):
+                for idx, meta in enumerate(self._apc_meta):
+                    prefix_len = int((meta or {}).get("prefix_len") or 0)
+                    if prefix_len <= 0:
+                        continue
+                    deferred = apc_coordinator.defer_checkpoint(
+                        meta["full_input_ids"][:prefix_len],
+                        warm_cache,
+                        batch_idx=idx,
+                        extra_hash=meta.get("extra_hash", 0),
+                    )
+                    if deferred is not None:
+                        meta.setdefault("apc_deferred", []).append(deferred)
         elif draft_model is not None and draft_kind is not None:
             self.prompt_cache = make_speculative_prompt_cache(
                 model,
@@ -2186,6 +2225,9 @@ class PromptProcessingBatch:
             meta = self._apc_meta[idx]
             if meta is not None:
                 self._apc_manager.release(meta.get("apc_blocks", []))
+                _finish_deferred_checkpoints(
+                    meta.get("apc_deferred") or [], self.prompt_cache, idx, release=not keep
+                )
 
         for rows in (
             self.uids,
@@ -2325,7 +2367,19 @@ class PromptProcessingBatch:
             if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
                 continue
             coordinator = getattr(self, "_apc_coordinator", None)
-            if coordinator is not None:
+            deferred = None
+            if coordinator is not None and not any(self._right_pad_per_row or ()):
+                deferred = coordinator.defer_checkpoint(
+                    meta["full_input_ids"][:checkpoint_len],
+                    self.prompt_cache,
+                    batch_idx=batch_idx,
+                    extra_hash=meta.get("extra_hash", 0),
+                )
+            if deferred is not None:
+                # APC_SINGLE_COPY: stored from this row's cache when it leaves.
+                meta.setdefault("apc_deferred", []).append(deferred)
+                stored = True
+            elif coordinator is not None:
                 stored = coordinator.store_checkpoint(
                     meta["full_input_ids"][:checkpoint_len],
                     self.prompt_cache,
@@ -2674,6 +2728,18 @@ class PromptProcessingBatch:
                     if meta is not None:
                         self._apc_manager.release(meta.get("apc_blocks", []))
 
+        deferred = [
+            list((meta or {}).get("apc_deferred") or []) for meta in self._apc_meta
+        ]
+        if any(deferred):
+            if isinstance(gen_batch, GenerationBatch):
+                # Stored when each row leaves the generation batch.
+                gen_batch.apc_deferred = deferred
+            else:
+                for idx, rows in enumerate(deferred):
+                    _finish_deferred_checkpoints(
+                        rows, self.prompt_cache, idx, release=False
+                    )
         self.uids = []
         self.prompt_cache = []
         self._token_context = []
@@ -2974,6 +3040,12 @@ class BatchGenerator:
     def _release_prefill_pick(self, pick):
         if pick is not None:
             self.apc_manager.release(pick.get("matched_blocks", []))
+            if pick.get("warm_cache") is not None:
+                self.apc_manager.return_taken(
+                    pick["full_input_ids"][: pick["prefix_len"]],
+                    pick["warm_cache"],
+                    pick.get("extra_hash", 0),
+                )
             pick.clear()
 
     def _admit_prefill(self, sequences):

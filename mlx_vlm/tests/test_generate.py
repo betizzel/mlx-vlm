@@ -3214,6 +3214,82 @@ def test_apc_native_checkpoint_reuses_repeated_request(
         manager.close()
 
 
+@pytest.mark.parametrize("kv8", [False, True])
+def test_apc_single_copy_takes_and_returns_the_checkpoint(
+    kv8, mock_processor, monkeypatch
+):
+    """APC_SINGLE_COPY=1: a follow-up takes the conversation's checkpoint
+    instead of cloning it, nothing is copied out of the live cache at the
+    prefill boundary, and the row's own cache becomes the next checkpoint when
+    it leaves; a row removed mid-prefill hands the taken one back. Same tokens
+    and the same reuse as the copying path (Inkling: sliding, global and
+    convolution state; global K/V in BF16 or int8)."""
+    from mlx_vlm.tests.test_inkling2_loop import loop_case
+
+    monkeypatch.setenv("MLX_VLM_INKLING_KV8", "1" if kv8 else "0")
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    monkeypatch.setenv("APC_EVICT_SUPERSEDED", "1")
+    mock_processor.tokenizer.stopping_criteria.eos_token_ids = []
+    model = loop_case(mx.bfloat16)[0].language_model
+
+    def copying(*args, **kwargs):
+        pytest.fail("single copy cloned or extracted a whole cache")
+
+    def insert(engine, ids):
+        # The server's text prompts carry a semantic hash instead of the embeddings'.
+        kwargs = {"inputs_embeds": model.model.embed(mx.array([ids])), "_apc_semantic_hash": 7}
+        return engine.insert([ids], prompt_kwargs=[kwargs])
+
+    def conversation(single_copy):
+        monkeypatch.setenv("APC_SINGLE_COPY", "1" if single_copy else "0")
+        with monkeypatch.context() as m:
+            if single_copy:
+                m.setattr(apc_module, "_clone_prompt_cache_for_apc", copying)
+                m.setattr(apc_module, "snapshot_prompt_cache_row", copying)
+            manager = apc_module.APCManager(num_blocks=16, block_size=8, disk=None)
+            engine = BatchGenerator(
+                model,
+                mock_processor,
+                max_tokens=6,
+                completion_batch_size=1,
+                prefill_batch_size=1,
+                prefill_step_size=8,
+                apc_manager=manager,
+                manage_wired_limit=False,
+            )
+            outputs, prompt = [], list(range(1, 41))
+            try:
+                for turn in range(3):
+                    insert(engine, prompt)
+                    out = []
+                    for _ in range(40):
+                        out.extend(r.token for r in engine.next()[1])
+                        if len(out) == 6:
+                            break
+                    outputs.append(out)
+                    # The finished row's cache is the conversation's one checkpoint.
+                    stored = [e.token_ids for e in manager._exact_cache.values()]
+                    assert stored == [tuple(prompt[:-1])]
+                    assert not manager._moved
+                    prompt = prompt + out + list(range(50 + turn, 60 + turn))
+                # Removed during its prefill: the checkpoint it restored is back.
+                restored = tuple(stored[0])
+                (uid,) = insert(engine, prompt + list(range(70, 100)))
+                engine.next()
+                assert engine.remove(uid)
+                stored = [e.token_ids for e in manager._exact_cache.values()]
+                assert restored in stored or any(
+                    s[: len(restored)] == restored for s in stored
+                )
+                assert not manager._moved
+                return outputs, manager.stats.exact_hits
+            finally:
+                engine.close()
+                manager.close()
+
+    assert conversation(True) == conversation(False)
+
+
 def test_prefill_chunk_bounds_work_with_decoding_peers():
     gen = object.__new__(BatchGenerator)
     gen._wire_stack = None
