@@ -193,6 +193,44 @@ def test_fused_decode_matches_reference(dtype, prompt, batch_cache, monkeypatch)
     np.testing.assert_allclose(alternated, expected, atol=tol, rtol=tol)
 
 
+@pytest.mark.parametrize("mode,group_size,bits", [("affine", 32, 4), ("mxfp8", 32, 8), ("nvfp4", 16, 4)])
+def test_fused_decode_stacks_quantized_attention(mode, group_size, bits, monkeypatch):
+    # Quantized attention projections stack into one quantized product as the BF16 ones do (row slices of the same
+    # weights, scales and biases): the fused step must still equal the reference on the same quantized model.
+    import mlx.nn as nn
+
+    from mlx_vlm.models.inkling2 import fused
+
+    target, _ = loop_case(mx.float32)
+    lm = target.language_model
+    names = ("q_proj", "r_proj", "gate_proj", "k_proj", "v_proj", "o_proj")
+    nn.quantize(
+        lm,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        class_predicate=lambda p, m: isinstance(m, nn.Linear) and p.rsplit(".", 1)[-1] in names,
+    )
+    ids = (mx.arange(80) % 60 + 1)[None].astype(mx.int32)
+    supported, steps = fused.supported, []
+
+    def run(use_fused):
+        monkeypatch.setattr(
+            fused,
+            "supported",
+            (lambda *a: steps.append(1) or supported(*a)) if use_fused else (lambda *a: False),
+        )
+        cache = lm.make_cache()
+        lm(ids[:, :70], cache=cache)
+        out = [lm(ids[:, i : i + 1], cache=cache).logits for i in range(70, 80)]
+        return np.array(mx.concatenate(out, axis=1))
+
+    expected = run(False)
+    actual = run(True)
+    assert steps, "the fused path never ran"
+    np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=2e-3)
+
+
 @pytest.mark.parametrize("keys,start", [(700, 0), (5000, 0), (5000, 700)])
 def test_split_k_decode_attention_matches_sdpa(keys, start):
     # Global layers decode through the split-K kernel past a few thousand keys:

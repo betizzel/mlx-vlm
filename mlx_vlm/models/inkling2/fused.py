@@ -658,32 +658,62 @@ class _Consts:
         self.router_b = f32(layer.mlp.e_score_correction_bias)
         self.sink_w = A.sink_proj.weight
         mods = [A.q_proj, A.r_proj, A.gate_proj, A.k_proj, A.v_proj]
-        weights = mx.concatenate([m.weight for m in mods])
-        mx.eval(weights)
+        # BF16, or quantized (any mode quantized_matmul takes): row slices of the same arrays either way, since
+        # quantization groups run along the input dimension.
+        names = [n for n in ("weight", "scales", "biases") if n in mods[0]]
+        parts = [mx.concatenate([m[n] for m in mods]) for n in names]
+        mx.eval(parts)
         self.at, start = [], 0
         for m in mods:
             rows = m.weight.shape[0]
             self.at.append(start)
-            m.weight = weights[start : start + rows]
+            for n, p in zip(names, parts):
+                setattr(m, n, p[start : start + rows])
             start += rows
-        self.stack = weights
-        self.head = weights[: self.at[3]]
+        q = mods[0]
+        self.quant = (q.group_size, q.bits, q.mode) if isinstance(q, nn.QuantizedLinear) else None
+        self.stack = parts
+        self.head = [p[: self.at[3]] for p in parts]
         mx.eval([v for v in vars(self).values() if isinstance(v, mx.array)], [m.parameters() for m in mods])
 
 
+def _project(x: mx.array, parts, quant) -> mx.array:
+    """``x`` times the stacked projections ``parts`` (weight[, scales[, biases]]), transposed."""
+    if quant is None:
+        return x @ parts[0].T
+    group_size, bits, mode = quant
+    return mx.quantized_matmul(
+        x,
+        parts[0],
+        parts[1],
+        parts[2] if len(parts) > 2 else None,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+
+
 def _plain_projections(text_model) -> bool:
-    """Unsharded, unquantized attention projections without biases: the ones _Consts stacks into one matrix."""
+    """Unsharded attention projections without biases that _Consts can stack into one matrix: in each layer all BF16
+    / FP32 ``nn.Linear``, or all ``nn.QuantizedLinear`` of one group size, width and mode."""
     ok = getattr(text_model, "_fused_plain", None)
     if ok is None:
-        attns = [layer.self_attn for layer in text_model.layers]
-        ok = all(
-            A.sharding_group is None
-            and all(
-                type(m) is nn.Linear and "bias" not in m
-                for m in (A.q_proj, A.r_proj, A.gate_proj, A.k_proj, A.v_proj)
+
+        def stackable(A):
+            mods = (A.q_proj, A.r_proj, A.gate_proj, A.k_proj, A.v_proj)
+            if A.sharding_group is not None or any("bias" in m for m in mods):
+                return False
+            if all(type(m) is nn.Linear for m in mods):
+                return True
+            first = mods[0]
+            return all(
+                type(m) is nn.QuantizedLinear
+                and (m.group_size, m.bits, m.mode) == (first.group_size, first.bits, first.mode)
+                for m in mods
             )
-            for A in attns
-        )
+
+        ok = all(stackable(layer.self_attn) for layer in text_model.layers)
         object.__setattr__(text_model, "_fused_plain", ok)
     return ok
 
@@ -816,10 +846,10 @@ def _visit(layer, c: _Consts, cfg, x, blocks, kv, conv, messages):
             value = 1.0 + cfg.log_scaling_alpha * math.log(max(p / cfg.log_scaling_n_floor, 1.0))
             tau = _small(_F32, (value,) * M)
     if xk is xq and xv is xq:  # one input: every projection in one read
-        q = r = k = v = gate = xq @ c.stack.T
+        q = r = k = v = gate = _project(xq, c.stack, c.quant)
         at, gate_at = (c.at[0], c.at[1], c.at[3], c.at[4]), c.at[2]
     else:
-        q = r = gate = xq @ c.head.T
+        q = r = gate = _project(xq, c.head, c.quant)
         k, v, at, gate_at = A.k_proj(xk), A.v_proj(xv), (c.at[0], c.at[1], 0, 0), c.at[2]
     qo, bias, ko, vo, sinks, ks, vs = kv_prep(
         q,
