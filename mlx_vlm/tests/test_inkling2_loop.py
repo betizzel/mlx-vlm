@@ -231,6 +231,31 @@ def test_fused_decode_stacks_quantized_attention(mode, group_size, bits, monkeyp
     np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=2e-3)
 
 
+def test_requantize_from_env_quantizes_matching_layers_in_memory(monkeypatch):
+    # MLX_VLM_REQUANTIZE serves a checkpoint's BF16 layers at fewer bits without a converted copy on disk: only the
+    # layers its patterns match change, the model still answers as before (8-bit), and a pattern that matches
+    # nothing is an error rather than a silent no-op.
+    from mlx_vlm import utils
+
+    target, _ = loop_case()
+    ids = (mx.arange(12) % 60 + 1)[None].astype(mx.int32)
+    before = np.array(target.language_model(ids).logits)
+    attention = r"language_model\.model\.layers\.\d+\.self_attn\.(q|r|gate|k|v|o)_proj$"
+    monkeypatch.setenv(
+        "MLX_VLM_REQUANTIZE", f"{attention}:affine:32:8,language_model\\.lm_head$:affine:32:8"
+    )
+    layers = target.language_model.model.layers
+    assert utils.requantize_from_env(target) == 6 * len(layers) + 1
+    attn = layers[0].self_attn
+    assert type(attn.q_proj).__name__ == "QuantizedLinear"
+    assert type(attn.sink_proj).__name__ == "Linear"
+    after = np.array(target.language_model(ids).logits)
+    np.testing.assert_allclose(after, before, atol=5e-2)
+    monkeypatch.setenv("MLX_VLM_REQUANTIZE", "no_such_layer:affine:32:8")
+    with pytest.raises(ValueError, match="no nn.Linear layer matches"):
+        utils.requantize_from_env(target)
+
+
 @pytest.mark.parametrize("keys,start", [(700, 0), (5000, 0), (5000, 700)])
 def test_split_k_decode_attention_matches_sdpa(keys, start):
     # Global layers decode through the split-K kernel past a few thousand keys:

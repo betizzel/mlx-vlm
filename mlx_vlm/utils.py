@@ -5,6 +5,8 @@ import inspect
 import json
 import logging
 import math
+import os
+import re
 import struct
 import warnings
 from dataclasses import dataclass, fields
@@ -889,6 +891,41 @@ def update_module_configs(model_config, model_class, config, modules):
     return model_config
 
 
+def requantize_from_env(model: nn.Module) -> int:
+    """Requantize matching ``nn.Linear`` layers in memory after loading, from ``MLX_VLM_REQUANTIZE``:
+    comma-separated ``PATTERN:MODE:GROUP_SIZE:BITS`` items, each ``PATTERN`` a regular expression searched in the
+    module's path (e.g. ``language_model\\.lm_head$:affine:64:8``). Nothing is written to disk: a checkpoint's
+    BF16 layers can be served at fewer bits without keeping a converted copy. Returns the number of layers changed.
+    """
+    spec = os.environ.get("MLX_VLM_REQUANTIZE", "").strip()
+    changed = 0
+    for item in filter(None, (s.strip() for s in spec.split(","))):
+        pattern, mode, group_size, bits = item.rsplit(":", 3)
+        rx, group_size, bits = re.compile(pattern), int(group_size), int(bits)
+        hits = []
+
+        def predicate(path, module):
+            ok = (
+                type(module) is nn.Linear
+                and rx.search(path) is not None
+                and module.weight.shape[-1] % group_size == 0
+            )
+            if ok:
+                hits.append(path)
+            return ok
+
+        nn.quantize(model, group_size=group_size, bits=bits, mode=mode, class_predicate=predicate)
+        if not hits:
+            raise ValueError(f"MLX_VLM_REQUANTIZE: no nn.Linear layer matches {pattern!r}")
+        logging.getLogger(__name__).info(
+            "Requantized %d layers matching %r to %s %d-bit, group %d", len(hits), pattern, mode, bits, group_size
+        )
+        changed += len(hits)
+    if changed:
+        mx.eval(model.parameters())
+    return changed
+
+
 def load(
     path_or_hf_repo: str,
     adapter_path: Optional[str] = None,
@@ -949,6 +986,7 @@ def load(
             progress_callback=report.update if progress_callback is not None else None,
             **kwargs,
         )
+        requantize_from_env(model)
         if adapter_path is not None:
             report("loading_adapter")
             model = apply_lora_layers(model, adapter_path)
