@@ -27,6 +27,7 @@ split-K decode kernel or fused SDPA) run the reference, and both leave the same 
 from __future__ import annotations
 
 import math
+import os
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -36,6 +37,10 @@ from ..cache import ArraysCache, BatchKVCache, BatchRotatingKVCache, KVCache, Ro
 
 _F32 = mx.float32
 _KV = (KVCache, RotatingKVCache, BatchKVCache, BatchRotatingKVCache)
+# MLX_VLM_INKLING_FUSED_DECODE=0 decodes with the reference modules instead (~20% slower). The two paths agree to
+# BF16 rounding, but near-ties can tip a long reasoning answer either way: on long-document retrieval questions
+# (greedy, effort none) the fused step looped in 5 of 19 documents and the reference in 2.
+ENABLED = os.environ.get("MLX_VLM_INKLING_FUSED_DECODE", "1") != "0"
 
 # Sums over a threadgroup: each lane's value summed over its simdgroup, the simdgroups' sums added by every thread.
 _HEADER = """
@@ -688,7 +693,7 @@ def supported(text_model, h: mx.array, cache) -> bool:
     attention below takes one row), on Metal, BF16 or FP32, every visit's caches of the kinds the kernels read,
     nothing speculative and nothing padded."""
     B, L = h.shape[:2]
-    if B != 1 or L != 1 or cache is None or not mx.metal.is_available() or mx.default_device() != mx.gpu:
+    if not ENABLED or B != 1 or L != 1 or cache is None or not mx.metal.is_available() or mx.default_device() != mx.gpu:
         return False
     if h.dtype not in (mx.bfloat16, mx.float32) or not _plain_projections(text_model):
         return False
