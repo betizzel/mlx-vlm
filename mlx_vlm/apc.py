@@ -3333,10 +3333,18 @@ class APCManager:
             evicted = 0
             while resident > target:
                 if self._exact_cache:
-                    resident -= _cache_nbytes(
-                        self._exact_cache[next(iter(self._exact_cache))].prompt_cache
-                    )
+                    entry = self._exact_cache[next(iter(self._exact_cache))]
+                    resident -= _cache_nbytes(entry.prompt_cache)
                     self._exact_cache.popitem(last=False)
+                    apc_trace(
+                        "evict",
+                        mode="exact",
+                        token_len=len(entry.token_ids),
+                        required_mb=required >> 20,
+                        prefill_reserve_mb=prefill >> 20,
+                        allocation_mb=allocation_bytes >> 20,
+                        target_mb=target >> 20,
+                    )
                 else:
                     block = self._free_head
                     while block is not None and block.block_hash is None:
@@ -3639,6 +3647,19 @@ class APCManager:
             # Its buffers are already allocated: only the growth is new.
             restore_bytes = max(0, restore_bytes - _cache_nbytes(source_cache))
         if not self._make_room(restore_bytes):
+            apc_trace(
+                "restore",
+                mode="exact",
+                ok=False,
+                reason="memory",
+                token_len=prefix_len,
+                moving=moving,
+                restore_mb=restore_bytes >> 20,
+                headroom_mb=self._memory_headroom() >> 20,
+                reserve_mb=self.memory_reserve_bytes >> 20,
+                prefill_reserve_mb=self._prefill_reserve_bytes >> 20,
+                resident_mb=self.resident_bytes() >> 20,
+            )
             with self.lock:
                 self.stats.memory_skips += 1
             if defer_on_pressure:
