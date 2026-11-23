@@ -3290,6 +3290,54 @@ def test_apc_single_copy_takes_and_returns_the_checkpoint(
     assert conversation(True) == conversation(False)
 
 
+def test_apc_single_copy_keeps_every_checkpoint_when_rows_leave_together(
+    mock_processor, monkeypatch
+):
+    """APC_SINGLE_COPY=1 with two conversations in one batch that finish in
+    the same step: each row cuts its checkpoint from the shared cache before
+    the buffers are released, so both are stored (releasing on the first row
+    lost the second's)."""
+    from mlx_vlm.tests.test_inkling2_loop import loop_case
+
+    monkeypatch.setenv("MLX_VLM_INKLING_KV8", "0")
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    monkeypatch.setenv("APC_EVICT_SUPERSEDED", "1")
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    mock_processor.tokenizer.stopping_criteria.eos_token_ids = []
+    model = loop_case(mx.bfloat16)[0].language_model
+    manager = apc_module.APCManager(num_blocks=16, block_size=8, disk=None)
+    engine = BatchGenerator(
+        model,
+        mock_processor,
+        max_tokens=4,
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        prefill_step_size=64,
+        apc_manager=manager,
+        manage_wired_limit=False,
+    )
+    prompts = [list(range(1, 41)), list(range(2, 50))]
+    try:
+        engine.insert(
+            prompts,
+            prompt_kwargs=[
+                {"inputs_embeds": model.model.embed(mx.array([p])), "_apc_semantic_hash": 7}
+                for p in prompts
+            ],
+        )
+        done = 0
+        for _ in range(40):
+            done += sum(r.finish_reason is not None for r in engine.next()[1])
+            if done == 2:
+                break
+        assert done == 2
+        stored = sorted(len(e.token_ids) for e in manager._exact_cache.values())
+        assert stored == [len(prompts[0]) - 1, len(prompts[1]) - 1]
+    finally:
+        engine.close()
+        manager.close()
+
+
 def test_prefill_chunk_bounds_work_with_decoding_peers():
     gen = object.__new__(BatchGenerator)
     gen._wire_stack = None

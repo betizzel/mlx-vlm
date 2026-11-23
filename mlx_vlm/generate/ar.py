@@ -1471,12 +1471,20 @@ class GenerationBatch:
             self._eval_pending_state()
         if self.apc_deferred:
             kept = set(keep)
-            for idx, rows in enumerate(self.apc_deferred):
-                if rows and idx not in kept:
-                    # A leaving row: with no row left its buffers become the checkpoint.
-                    _finish_deferred_checkpoints(
-                        rows, self.prompt_cache, idx, release=not keep
-                    )
+            leaving = [
+                idx
+                for idx, rows in enumerate(self.apc_deferred)
+                if rows and idx not in kept
+            ]
+            for idx in leaving:
+                # With no row left the buffers become the checkpoint, but only
+                # once every leaving row has cut its own rows from them.
+                _finish_deferred_checkpoints(
+                    self.apc_deferred[idx],
+                    self.prompt_cache,
+                    idx,
+                    release=not keep and idx == leaving[-1],
+                )
             self.apc_deferred = [self.apc_deferred[idx] for idx in keep]
 
         self.uids = [self.uids[idx] for idx in keep]
