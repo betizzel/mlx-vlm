@@ -14,9 +14,15 @@
 > 5. The exact prefix cache keeps a growing conversation's checkpoint when memory is tight: a snapshot that extends the
 >    resident checkpoint replaces it without also reserving memory for the next prefill. Before, the 27B at ~99K
 >    tokens re-read the whole conversation on every second turn.
+> 6. A follow-up's prefill reserve counts the checkpoint it restores. The server (before embedding a request) and the
+>    scheduler (before the lookup) both reserved a cold prefill of the whole prompt, twice its cache, which near the
+>    window evicted the very checkpoint the follow-up was about to restore; and a restored prefix was budgeted again.
+>    Both now pass the resident checkpoint's length (`APCCoordinator.prefix_hint`), and only the suffix is reserved.
+>    Found on Inkling 2 Mini at 150K tokens: the first follow-up after a long document re-read it (400 s), 1.7 s after.
+>    `APC_TRACE=1` now also logs refused restores and each checkpoint evicted to make room.
 >
 > Each change comes with regression tests. Upstream: [Neywa-Labs/mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) (MIT).
-> Fixes 1 and 2 still apply to upstream 0.8.0; upstream 0.8.0 added its own MTP thinking-budget support.
+> Fixes 1, 2 and 6 still apply to upstream 0.8.0; upstream 0.8.0 added its own MTP thinking-budget support.
 
 [![Upload Python Package](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml/badge.svg)](https://github.com/Blaizzy/mlx-vlm/actions/workflows/python-publish.yml)
 # MLX-VLM

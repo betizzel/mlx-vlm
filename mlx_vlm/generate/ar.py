@@ -2693,6 +2693,20 @@ class BatchGenerator:
         boundary = self._apc_exact_checkpoint_len(ids_list)
         return [boundary] if boundary > 0 else []
 
+    def _apc_prefix_hint(self, sequence) -> int:
+        """Length of the resident checkpoint this prompt would restore, so the
+        admission reserve before the lookup does not also budget a cold prefill
+        of the prefix the restore is about to provide."""
+        hint = getattr(getattr(self, "apc", None), "prefix_hint", None)
+        _, ids_list, _, prompt_kwargs, _, _ = sequence
+        if hint is None or not ids_list or len(ids_list) < 2:
+            return 0
+        return hint(
+            ids_list,
+            extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
+            min_prefix_tokens=self._apc_safe_prefix_lookup_min(ids_list),
+        )
+
     def _apc_pick_for(self, sequence) -> Optional[dict]:
         """Look up an APC prefix for ``sequence``. Returns dict with matched
         blocks + suffix metadata when there is a usable hit, else None.
@@ -3156,6 +3170,7 @@ class BatchGenerator:
                 coordinator.prepare_prefill(
                     [len(s[1]) for s in sequences],
                     prefill_step_size=self.prefill_step_size,
+                    prefix_lengths=[self._apc_prefix_hint(s) for s in sequences],
                 )
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(

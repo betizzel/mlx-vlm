@@ -1842,9 +1842,27 @@ class ResponseGenerator:
                     # already happened on the caller thread.
                     coordinator = getattr(batch_gen, "apc", None)
                     if coordinator is not None:
+                        # Credit the resident checkpoint a text prompt would
+                        # restore, as the scheduler's admission does: reserving
+                        # a cold prefill of the whole prompt evicts that
+                        # checkpoint before the lookup (Inkling, a 150K follow-up:
+                        # a 10 GB reserve dropped its 4.8 GB checkpoint).
+                        prefix = 0
+                        ids = raw_inputs.get("input_ids")
+                        if (
+                            request.apc_semantic_hash is not None
+                            and images is None
+                            and raw_inputs.get("pixel_values") is None
+                            and ids is not None
+                        ):
+                            prefix = coordinator.prefix_hint(
+                                ids.reshape(-1).tolist(),
+                                extra_hash=int(request.apc_semantic_hash),
+                            )
                         coordinator.prepare_prefill(
                             prompt_tokens,
                             prefill_step_size=self._effective_prefill_step_size(),
+                            prefix_lengths=[prefix],
                         )
                     input_ids, gen_kwargs = self._gpu_embed(
                         raw_inputs,

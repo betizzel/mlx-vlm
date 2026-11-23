@@ -1585,6 +1585,73 @@ def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
     manager.release(pick["matched_blocks"])
 
 
+def test_apc_prefill_reserve_counts_a_restored_prefix_once():
+    # A follow-up on a long conversation restores the checkpoint (allocated at
+    # the prompt's capacity), so only its short suffix still needs the growth
+    # reserve. Budgeting a cold prefill of the whole prompt again evicted the
+    # checkpoint near the window (Inkling 2 Mini at 125K and 150K).
+    from mlx_vlm.apc_coordinator import PrefillMemoryPlan
+    from mlx_vlm.models.cache import CacheMemory
+
+    plan = PrefillMemoryPlan()
+    plan.observe(
+        [
+            CacheMemory(bytes_per_token=1000.0),
+            CacheMemory(bytes_per_token=1000.0, window_size=1024),
+        ],
+        live_bytes=0,
+    )
+    cold = plan.prepare([100_040], chunk_size=2048)
+    warm = plan.prepare([100_040], chunk_size=2048, prefix_lengths=[100_000])
+    assert cold == 2 * (100_040 + 1024 - 1 + 2048) * 1000
+    assert warm == 2 * 40 * 1000
+
+
+def test_apc_admission_reserve_keeps_the_checkpoint_a_follow_up_restores(
+    monkeypatch,
+):
+    # The scheduler's admission (and the server's reserve before embedding)
+    # reserve the prefill before the lookup. A follow-up must be sized with the
+    # resident checkpoint it will restore: a cold reserve of the whole prompt
+    # evicted it first, and the turn re-read the conversation.
+    from mlx_vlm.models.cache import KVCache
+
+    semantic_hash = 5
+    tokens, suffix = list(range(64)), list(range(100, 116))
+    manager = apc_module.APCManager(num_blocks=4, block_size=4)
+    manager.memory_reserve_bytes = 0
+    monkeypatch.setattr(apc_module, "_free_ram_bytes", lambda: 1 << 40)
+    source = KVCache()
+    source.step = 1
+    source.keys = mx.ones((1, 1, len(tokens), 4))
+    source.values = source.keys + 1
+    source.offset = len(tokens)
+    mx.eval(source.state)
+    model = SimpleNamespace(make_cache=lambda: [KVCache()], layers=[None])
+    coordinator = manager.coordinator(model)
+    assert manager.store_exact_cache(tokens, [source], extra_hash=semantic_hash)
+    size = apc_module._cache_nbytes([source])
+    # Room for the suffix's growth beside the checkpoint, not for the whole prompt twice.
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: size)
+
+    batch_generator = object.__new__(BatchGenerator)
+    batch_generator.apc_manager = manager
+    batch_generator.apc = coordinator
+    batch_generator.apc_mode = "exact"
+    batch_generator.model = SimpleNamespace(config=SimpleNamespace())
+    batch_generator._wire_stack = None
+    sequence = (1, tokens + suffix, 1, {"_apc_semantic_hash": semantic_hash}, [], None)
+    hint = batch_generator._apc_prefix_hint(sequence)
+    assert hint == len(tokens)
+    coordinator.prepare_prefill(
+        [len(tokens + suffix)], prefill_step_size=16, prefix_lengths=[hint]
+    )
+    assert manager.exact_prefix_hint(tokens + suffix, extra_hash=semantic_hash) == hint
+    # Without the hint the same reserve evicts it.
+    coordinator.prepare_prefill([len(tokens + suffix)], prefill_step_size=16)
+    assert manager.exact_prefix_hint(tokens + suffix, extra_hash=semantic_hash) == 0
+
+
 def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     class EmptyGenerationBatch:
         def __len__(self):
